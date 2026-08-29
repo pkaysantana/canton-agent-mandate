@@ -8,7 +8,8 @@ or settlement policy.  Those decisions remain in the Daml mandate.
 
 ## Configuration
 
-Recipient aliases are supplied as JSON; party IDs are never embedded in source:
+Live recipient aliases are supplied as JSON; Party IDs are never embedded in
+source:
 
 ```powershell
 $env:D1_RECIPIENTS_JSON='{"pharmacy":"party-id-here","school":"party-id-here","receiver":"party-id-here","eve":"party-id-here"}'
@@ -25,6 +26,11 @@ If their keys are present, the compact fallback chain is Gemini
 `gemini-3.7-flash`, OpenRouter `z-ai/glm-5.2:free`, then `openrouter/free`.
 Provider errors never become payment attempts.  With no working provider, the
 program exits and points the operator to deterministic `--manual-json` mode.
+
+When `--dry-run` is present and `D1_RECIPIENTS_JSON` is absent, the runtime uses
+clearly labeled synthetic aliases for `pharmacy` and `eve`.  These values can
+never enter live mode.  Manual JSON dry-runs therefore need no inference or
+Canton configuration; natural-language dry-runs still need an inference key.
 
 Live settlement also needs:
 

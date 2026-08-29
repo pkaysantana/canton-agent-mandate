@@ -40,6 +40,10 @@ Do not modify requested values to comply with policy.
 Return only the requested structured schema."""
 
 RULE = "-" * 33
+DRY_RUN_ALIASES = {
+    "pharmacy": "dry-run-pharmacy",
+    "eve": "dry-run-eve",
+}
 SECRET_ENV_NAMES = (
     "LLM_API_KEY",
     "GROQ_API_KEY",
@@ -273,9 +277,13 @@ def infer_intent(
     raise InferenceUnavailable("all configured inference providers failed")
 
 
-def aliases_from_env(env: Mapping[str, str] = os.environ) -> dict[str, str]:
+def aliases_from_env(
+    env: Mapping[str, str] = os.environ, *, dry_run: bool = False
+) -> tuple[dict[str, str], bool]:
     raw = env.get("D1_RECIPIENTS_JSON", "")
     if not raw:
+        if dry_run:
+            return dict(DRY_RUN_ALIASES), True
         raise ConfigurationError("D1_RECIPIENTS_JSON is not set")
     try:
         value = json.loads(raw)
@@ -293,7 +301,7 @@ def aliases_from_env(env: Mapping[str, str] = os.environ) -> dict[str, str]:
         if normalized in aliases:
             raise ConfigurationError(f"duplicate case-insensitive alias: {alias}")
         aliases[normalized] = party
-    return aliases
+    return aliases, False
 
 
 def ledger_config_from_env(env: Mapping[str, str] = os.environ) -> LedgerConfig:
@@ -372,11 +380,16 @@ def run_action(
     ledger: LedgerConfig | None,
     dry_run: bool,
     out: TextIO = sys.stdout,
-    settle: Callable[..., Mapping[str, object]] = charge_and_settle,
+    settle: Callable[..., Mapping[str, object]] | None = None,
+    synthetic_aliases: bool = False,
 ) -> bool:
     """Resolve and either display or invoke the one bounded financial tool."""
+    if synthetic_aliases and not dry_run:
+        raise ConfigurationError("synthetic recipient aliases are dry-run only")
     party = resolve_recipient(intent, aliases)
     _show_action(intent, party, out)
+    if synthetic_aliases:
+        print("(synthetic dry-run alias; not a Canton Party ID)", file=out)
     print(f"\n{RULE}", file=out)
     print("LEDGER RESULT", file=out)
     print(RULE, file=out)
@@ -390,7 +403,7 @@ def run_action(
     try:
         # This is deliberately the only value-moving call in the runtime.
         # Amount, recipient, expiry, allow-list, and cap policy stay in Daml.
-        settlement = settle(
+        settlement = (settle or charge_and_settle)(
             ledger.mandate_cid,
             ledger.owner,
             ledger.spender,
@@ -448,15 +461,26 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: --timeout must be greater than zero", file=sys.stderr)
         return 2
     try:
-        aliases = aliases_from_env()
+        aliases, synthetic_aliases = aliases_from_env(dry_run=args.dry_run)
         if args.manual_json:
             intent = parse_intent_json(args.manual_json)
         else:
             intent, _provider = infer_intent(
-                args.instruction, providers_from_env(), args.timeout
+                args.instruction, providers_from_env(), args.timeout, out=sys.stdout
             )
         ledger = None if args.dry_run else ledger_config_from_env()
-        return 0 if run_action(intent, aliases, ledger, args.dry_run) else 1
+        return (
+            0
+            if run_action(
+                intent,
+                aliases,
+                ledger,
+                args.dry_run,
+                out=sys.stdout,
+                synthetic_aliases=synthetic_aliases,
+            )
+            else 1
+        )
     except InferenceUnavailable:
         print("inference unavailable", file=sys.stderr)
         print("use --manual-json for deterministic demo", file=sys.stderr)

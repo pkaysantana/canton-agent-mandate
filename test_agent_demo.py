@@ -151,6 +151,56 @@ class RuntimeBoundaryTests(unittest.TestCase):
         self.assertIn("DRY RUN", output.getvalue())
         self.assertIn("No Canton submission made", output.getvalue())
 
+    def test_manual_dry_run_is_offline_with_all_runtime_env_absent(self):
+        output = io.StringIO()
+        error = io.StringIO()
+        manual = '{"recipient":"pharmacy","amount":"0.001","reason":"medicine"}'
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "agent_demo.charge_and_settle",
+            side_effect=AssertionError("Canton settlement must not be called"),
+        ), mock.patch("sys.stdout", output), mock.patch("sys.stderr", error):
+            status = demo.main(["--dry-run", "--manual-json", manual])
+
+        self.assertEqual(status, 0, error.getvalue())
+        self.assertEqual(error.getvalue(), "")
+        self.assertIn("pharmacy -> dry-run-pharmacy", output.getvalue())
+        self.assertIn("synthetic dry-run alias", output.getvalue())
+        self.assertIn("No Canton submission made", output.getvalue())
+
+    def test_synthetic_aliases_cannot_be_used_live(self):
+        called = False
+
+        def forbidden(*_args):
+            nonlocal called
+            called = True
+            raise AssertionError("synthetic alias reached settlement")
+
+        with self.assertRaisesRegex(demo.ConfigurationError, "dry-run only"):
+            demo.run_action(
+                demo.PaymentIntent("pharmacy", "0.001", "medicine"),
+                demo.DRY_RUN_ALIASES,
+                self.ledger,
+                False,
+                out=io.StringIO(),
+                settle=forbidden,
+                synthetic_aliases=True,
+            )
+        self.assertFalse(called)
+
+    def test_live_mode_without_recipient_config_fails_closed(self):
+        output = io.StringIO()
+        error = io.StringIO()
+        manual = '{"recipient":"pharmacy","amount":"0.001","reason":"medicine"}'
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+            "agent_demo.charge_and_settle",
+            side_effect=AssertionError("Canton settlement must not be called"),
+        ), mock.patch("sys.stdout", output), mock.patch("sys.stderr", error):
+            status = demo.main(["--manual-json", manual])
+
+        self.assertEqual(status, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("D1_RECIPIENTS_JSON is not set", error.getvalue())
+
     def test_manual_json_uses_same_downstream_path(self):
         intent = demo.parse_intent_json(
             '{"recipient":"pharmacy","amount":"0.001","reason":"medicine"}'
