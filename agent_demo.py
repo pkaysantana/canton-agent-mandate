@@ -39,6 +39,12 @@ Do not decide whether the payment is allowed.
 Do not modify requested values to comply with policy.
 Return only the requested structured schema."""
 
+COMPATIBILITY_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+Return exactly one JSON object with exactly these string fields:
+recipient, amount, reason.
+Do not include Markdown, commentary, or additional fields."""
+
 RULE = "-" * 33
 DRY_RUN_ALIASES = {
     "pharmacy": "dry-run-pharmacy",
@@ -69,6 +75,10 @@ class IntentError(RuntimeErrorBase):
 
 class ProviderError(RuntimeErrorBase):
     pass
+
+
+class ProviderCompatibilityError(ProviderError):
+    """The provider answered, but not with the required structured shape."""
 
 
 class InferenceUnavailable(RuntimeErrorBase):
@@ -219,24 +229,73 @@ def parse_manual_intent(values: list[str] | tuple[str, str, str]) -> PaymentInte
     )
 
 
-def request_intent(provider: Provider, instruction: str, timeout: float) -> PaymentIntent:
-    """Call one OpenAI-compatible chat endpoint with strict JSON Schema."""
-    body = {
-        "model": provider.model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": instruction},
-        ],
-        "temperature": 0,
-        "response_format": {
+def _message_content(payload: object) -> str:
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise ProviderCompatibilityError("malformed or schema-invalid response") from None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") not in (
+                "text",
+                "output_text",
+            ) or not isinstance(part.get("text"), str):
+                raise ProviderCompatibilityError(
+                    "malformed or schema-invalid response"
+                )
+            parts.append(part["text"])
+        return "".join(parts)
+    raise ProviderCompatibilityError("malformed or schema-invalid response")
+
+
+def _unwrap_json_fence(content: str) -> str:
+    stripped = content.strip()
+    lines = stripped.splitlines()
+    if len(lines) >= 3 and lines[0].strip().casefold() in ("```", "```json"):
+        if lines[-1].strip() == "```":
+            return "\n".join(lines[1:-1]).strip()
+    return content
+
+
+def _request_intent(
+    provider: Provider,
+    instruction: str,
+    timeout: float,
+    *,
+    compatibility: bool,
+) -> PaymentIntent:
+    """Call one OpenAI-compatible endpoint and validate locally."""
+    response_format = (
+        {"type": "json_object"}
+        if compatibility
+        else {
             "type": "json_schema",
             "json_schema": {
                 "name": "payment_intent",
                 "strict": True,
                 "schema": INTENT_SCHEMA,
             },
-        },
+        }
+    )
+    body = {
+        "model": provider.model,
+        "messages": [
+            {
+                "role": "system",
+                "content": COMPATIBILITY_SYSTEM_PROMPT
+                if compatibility
+                else SYSTEM_PROMPT,
+            },
+            {"role": "user", "content": instruction},
+        ],
+        "temperature": 0,
+        "response_format": response_format,
     }
+    if compatibility and provider.model == "openrouter/free":
+        body["provider"] = {"require_parameters": True}
     request = urllib.request.Request(
         provider.base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -249,17 +308,48 @@ def request_intent(provider: Provider, instruction: str, timeout: float) -> Paym
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read())
-        content = payload["choices"][0]["message"]["content"]
-        if not isinstance(content, str):
-            raise ProviderError("provider returned non-text structured output")
+        content = _message_content(payload)
+        if compatibility:
+            content = _unwrap_json_fence(content)
         return parse_intent_json(content)
     except urllib.error.HTTPError as exc:
         # Do not echo response bodies: some gateways reflect request metadata.
+        if not compatibility and provider.model == "openrouter/free" and exc.code in (
+            400,
+            422,
+        ):
+            raise ProviderCompatibilityError(f"HTTP {exc.code}") from None
         raise ProviderError(f"HTTP {exc.code}") from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise ProviderError("network unavailable") from None
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError, IntentError):
-        raise ProviderError("malformed or schema-invalid response") from None
+    except ProviderCompatibilityError:
+        raise
+    except (json.JSONDecodeError, IntentError):
+        raise ProviderCompatibilityError(
+            "malformed or schema-invalid response"
+        ) from None
+
+
+def request_intent(provider: Provider, instruction: str, timeout: float) -> PaymentIntent:
+    """Call one OpenAI-compatible chat endpoint with strict JSON Schema."""
+    return _request_intent(
+        provider, instruction, timeout, compatibility=False
+    )
+
+
+def request_compatibility_intent(
+    provider: Provider, instruction: str, timeout: float
+) -> PaymentIntent:
+    """One OpenRouter free-router retry using JSON mode plus local validation."""
+    return _request_intent(provider, instruction, timeout, compatibility=True)
+
+
+def _log(message: str, out: TextIO) -> None:
+    try:
+        print(message, file=out)
+    except UnicodeEncodeError:
+        # Windows legacy consoles cannot encode the requested arrow glyph.
+        print(message.replace("→", "->"), file=out)
 
 
 def infer_intent(
@@ -268,18 +358,53 @@ def infer_intent(
     timeout: float,
     out: TextIO = sys.stdout,
     requester: Callable[[Provider, str, float], PaymentIntent] = request_intent,
+    compatibility_requester: Callable[
+        [Provider, str, float], PaymentIntent
+    ] = request_compatibility_intent,
 ) -> tuple[PaymentIntent, Provider]:
     if not providers:
         raise InferenceUnavailable("no inference provider is configured")
     for index, provider in enumerate(providers):
         try:
             return requester(provider, instruction, timeout), provider
-        except ProviderError:
+        except ProviderCompatibilityError as exc:
+            if provider.model == "openrouter/free":
+                _log(
+                    "OpenRouter free router strict mode incompatible → "
+                    "compatibility retry",
+                    out,
+                )
+                try:
+                    return (
+                        compatibility_requester(provider, instruction, timeout),
+                        provider,
+                    )
+                except ProviderError as retry_error:
+                    _log(
+                        f"OpenRouter free router compatibility retry failed: "
+                        f"{retry_error}",
+                        out,
+                    )
+                    continue
+            if provider.model == "z-ai/glm-5.2:free":
+                _log(f"OpenRouter GLM free failed: {exc}", out)
             if index + 1 < len(providers):
-                print(
+                if provider.model != "z-ai/glm-5.2:free":
+                    _log(
+                        f"{provider.name} unavailable -> "
+                        f"{providers[index + 1].name} fallback",
+                        out,
+                    )
+        except ProviderError as exc:
+            if provider.model == "z-ai/glm-5.2:free":
+                _log(f"OpenRouter GLM free failed: {exc}", out)
+            elif provider.model == "openrouter/free":
+                _log(f"OpenRouter free router failed: {exc}", out)
+            if index + 1 < len(providers) and provider.model != "z-ai/glm-5.2:free":
+                _log(
                     f"{provider.name} unavailable -> "
                     f"{providers[index + 1].name} fallback",
-                    file=out,
+                    out,
                 )
     raise InferenceUnavailable("all configured inference providers failed")
 

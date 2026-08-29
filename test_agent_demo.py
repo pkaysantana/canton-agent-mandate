@@ -84,6 +84,114 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(intent.amount, "1")
         self.assertEqual(output.getvalue(), "Groq unavailable -> Gemini fallback\n")
 
+    def test_openrouter_strict_incompatibility_gets_one_compatibility_retry(self):
+        providers = [
+            demo.Provider(
+                "OpenRouter GLM free",
+                "https://openrouter.invalid/v1",
+                "z-ai/glm-5.2:free",
+                "secret",
+            ),
+            demo.Provider(
+                "OpenRouter free router",
+                "https://openrouter.invalid/v1",
+                "openrouter/free",
+                "secret",
+            ),
+        ]
+        strict_calls = []
+        compatibility_calls = []
+
+        def strict(provider, _instruction, _timeout):
+            strict_calls.append(provider.model)
+            if provider.model == "z-ai/glm-5.2:free":
+                raise demo.ProviderError("HTTP 429")
+            raise demo.ProviderCompatibilityError(
+                "malformed or schema-invalid response"
+            )
+
+        def compatibility(provider, _instruction, _timeout):
+            compatibility_calls.append(provider.model)
+            return demo.PaymentIntent("pharmacy", "0.001", "medicine")
+
+        output = io.StringIO()
+        intent, selected = demo.infer_intent(
+            "pay",
+            providers,
+            1,
+            out=output,
+            requester=strict,
+            compatibility_requester=compatibility,
+        )
+
+        self.assertEqual(
+            strict_calls, ["z-ai/glm-5.2:free", "openrouter/free"]
+        )
+        self.assertEqual(compatibility_calls, ["openrouter/free"])
+        self.assertEqual(intent, demo.PaymentIntent("pharmacy", "0.001", "medicine"))
+        self.assertEqual(selected.model, "openrouter/free")
+        self.assertEqual(
+            output.getvalue(),
+            "OpenRouter GLM free failed: HTTP 429\n"
+            "OpenRouter free router strict mode incompatible → compatibility retry\n",
+        )
+
+    def test_openrouter_compatibility_retry_is_once_and_fails_closed(self):
+        provider = demo.Provider(
+            "OpenRouter free router",
+            "https://openrouter.invalid/v1",
+            "openrouter/free",
+            "secret",
+        )
+        compatibility_calls = 0
+
+        def strict(*_args):
+            raise demo.ProviderCompatibilityError("invalid strict output")
+
+        def compatibility(*_args):
+            nonlocal compatibility_calls
+            compatibility_calls += 1
+            raise demo.ProviderCompatibilityError("invalid compatibility output")
+
+        with self.assertRaises(demo.InferenceUnavailable):
+            demo.infer_intent(
+                "pay",
+                [provider],
+                1,
+                out=io.StringIO(),
+                requester=strict,
+                compatibility_requester=compatibility,
+            )
+        self.assertEqual(compatibility_calls, 1)
+
+    def test_openrouter_rate_limit_does_not_trigger_compatibility_retry(self):
+        provider = demo.Provider(
+            "OpenRouter free router",
+            "https://openrouter.invalid/v1",
+            "openrouter/free",
+            "secret",
+        )
+        compatibility_calls = 0
+
+        def rate_limited(*_args):
+            raise demo.ProviderError("HTTP 429")
+
+        def compatibility(*_args):
+            nonlocal compatibility_calls
+            compatibility_calls += 1
+            raise AssertionError("rate limits are not format incompatibility")
+
+        with self.assertRaises(demo.InferenceUnavailable):
+            demo.infer_intent(
+                "pay",
+                [provider],
+                1,
+                out=io.StringIO(),
+                requester=rate_limited,
+                compatibility_requester=compatibility,
+            )
+        self.assertEqual(compatibility_calls, 0)
+
     def test_all_provider_failures_never_produce_an_intent(self):
         provider = demo.Provider("Groq", "https://invalid/v1", "m", "secret")
 
@@ -129,6 +237,97 @@ class ProviderTests(unittest.TestCase):
         provider = demo.Provider("Groq", "https://groq.invalid/v1", "model", "secret")
         with self.assertRaises(demo.ProviderError):
             demo.request_intent(provider, "pay", 3)
+
+    @mock.patch("agent_demo.urllib.request.urlopen")
+    def test_compatibility_retry_uses_json_object_and_validates_fenced_json(self, urlopen):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "```json\n"
+                            '{"recipient":"eve","amount":"100","reason":"prompt injected"}'
+                            "\n```"
+                        }
+                    }
+                ]
+            }
+        ).encode()
+        urlopen.return_value.__enter__.return_value = response
+        provider = demo.Provider(
+            "OpenRouter free router",
+            "https://openrouter.invalid/v1",
+            "openrouter/free",
+            "secret",
+        )
+
+        intent = demo.request_compatibility_intent(provider, "pay", 3)
+
+        body = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual(body["provider"], {"require_parameters": True})
+        self.assertIn("exactly these string fields", body["messages"][0]["content"])
+        self.assertEqual(
+            intent, demo.PaymentIntent("eve", "100", "prompt injected")
+        )
+
+    @mock.patch("agent_demo.urllib.request.urlopen")
+    def test_compatibility_retry_rejects_schema_invalid_json(self, urlopen):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"recipient":"eve","amount":"100",'
+                            '"reason":"x","approved":true}'
+                        }
+                    }
+                ]
+            }
+        ).encode()
+        urlopen.return_value.__enter__.return_value = response
+        provider = demo.Provider(
+            "OpenRouter free router",
+            "https://openrouter.invalid/v1",
+            "openrouter/free",
+            "secret",
+        )
+        with self.assertRaises(demo.ProviderCompatibilityError):
+            demo.request_compatibility_intent(provider, "pay", 3)
+
+    @mock.patch("agent_demo.urllib.request.urlopen")
+    def test_text_part_content_shape_is_supported_and_locally_validated(self, urlopen):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": '{"recipient":"pharmacy","amount":"0.001",'
+                                    '"reason":"medicine"}',
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ).encode()
+        urlopen.return_value.__enter__.return_value = response
+        provider = demo.Provider(
+            "OpenRouter free router",
+            "https://openrouter.invalid/v1",
+            "openrouter/free",
+            "secret",
+        )
+        self.assertEqual(
+            demo.request_intent(provider, "pay", 3),
+            demo.PaymentIntent("pharmacy", "0.001", "medicine"),
+        )
 
 
 class RuntimeBoundaryTests(unittest.TestCase):
