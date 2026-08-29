@@ -213,8 +213,8 @@ class DemoSequenceTests(unittest.TestCase):
 
         def scripted_ledger(*args):
             calls.append(args)
-            if args[3] == "Eve::2":
-                raise demo.LabError("recipient not on allow-list")
+            if args[4] == "0.011":
+                raise demo.LabError("charge would exceed the cap")
             return accepted_settlement("Mandate#B")
 
         output = io.StringIO()
@@ -226,7 +226,7 @@ class DemoSequenceTests(unittest.TestCase):
             calls,
             [
                 ("Mandate#A", "Owner::1", "Agent::1", "Pharmacy::1", "0.001"),
-                ("Mandate#B", "Owner::1", "Agent::1", "Eve::2", "100"),
+                ("Mandate#B", "Owner::1", "Agent::1", "Pharmacy::1", "0.011"),
             ],
         )
         self.assertEqual(state.current_mandate_cid, "Mandate#B")
@@ -249,7 +249,7 @@ class DemoSequenceTests(unittest.TestCase):
         self.assertEqual(error.getvalue(), "")
         rendered = output.getvalue()
         self.assertIn("pharmacy -> dry-run-pharmacy", rendered)
-        self.assertIn("eve -> dry-run-eve", rendered)
+        self.assertIn("amount:    0.011 CC", rendered)
         self.assertNotIn("mandate advanced", rendered)
 
     def test_demo_sequence_live_mode_without_config_fails_closed(self):

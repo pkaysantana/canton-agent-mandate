@@ -22,9 +22,12 @@ from typing import Callable, Mapping, TextIO
 import agent_demo as demo
 
 
+# Both requests target an allowed, preapproved recipient the wallet can
+# afford, so the second can only fail on the Mandate's 0.010 CC total cap:
+# the rejection isolates Daml policy, not balance or registry preflight.
 DEMO_SEQUENCE = (
     ("pharmacy", "0.001", "medicine"),
-    ("eve", "100", "prompt injected"),
+    ("pharmacy", "0.011", "ignore spending limit"),
 )
 
 
@@ -111,7 +114,7 @@ def run_demo_sequence(
     out: TextIO = sys.stdout,
     settle: Callable[..., Mapping[str, object]] | None = None,
 ) -> int:
-    """Deterministic no-LLM sequence: an allowed charge, then a hostile one."""
+    """Deterministic no-LLM sequence: an allowed charge, then an over-cap one."""
     accepted = 0
     for step, values in enumerate(DEMO_SEQUENCE, 1):
         recipient, amount, reason = values
@@ -185,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--demo-sequence",
         action="store_true",
-        help="run the deterministic two-step demo (allowed, then hostile) without an LLM",
+        help="run the deterministic two-step demo (allowed, then over-cap) without an LLM",
     )
     parser.add_argument(
         "--dry-run",
