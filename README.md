@@ -1,183 +1,238 @@
-# Canton hackathon toolkit
+# Agent Mandate
 
-Get to your first Canton transaction without installing much.
+> **The AI decides what it wants to do. The ledger decides what it is allowed to do.**
 
-`c8lab.py` is Python 3, **stdlib only**, no `pip install`. That is deliberate:
-some laptops are locked down and you do not want to debug pip on the day.
+Agent Mandate is a Canton-native delegated financial-authority layer for autonomous agents. An owner gives an agent bounded authority — approved recipients, a cumulative spend cap, expiry and revocation — while the model itself is only responsible for proposing intent.
 
-It runs against two targets:
+If the requested payment is authorised, Daml settles Canton Coin atomically through the Canton Token Standard. If it is not authorised, the transaction fails on-ledger and **0 value moves**.
 
-- **LocalNet**, a whole Canton network in Docker on your laptop. The default.
-- **DevNet**, the shared Cantor8 node. Set four environment variables.
+Built for the Cantor8 London Hackathon, 29 August 2026.
 
-| File | What |
-|---|---|
-| `CHALLENGES.md` | The problems, and what to build |
-| `SETUP.md` | Install LocalNet, and the Daml toolchain if you need it |
-| `API.md` | Tested cheat sheet of the APIs you will use, and what needs a token |
-| `TROUBLESHOOTING.md` | Every error we actually hit, and the fix |
-| `c8lab.py` | The lab |
-| `daml-starter/` | Working Daml to copy from, including the mandate task |
+## Why this exists
 
-Start with `SETUP.md`, come back here.
+Giving an AI agent access to a wallet is not the same thing as giving it safe financial authority.
 
-**Looking for the problems?** They are in [`CHALLENGES.md`](CHALLENGES.md).
+The core design separates:
 
-## The lab
+- **probabilistic intent** — what the model wants to do;
+- **deterministic authority** — what the owner has actually authorised;
+- **settlement** — whether value is allowed to move.
 
-Six steps. This is the shape of every Canton app.
+The LLM/parser produces only:
 
-```
-1. Get a token                    the API is authenticated
-2. Allocate a party               your identity on the ledger
-3. Set up a TransferPreapproval   so people can pay you directly
-4. Read your balance from the ACS zero, at first
-5. Get some Canton Coin           LocalNet mints it, on DevNet ask the team
-6. Send a token standard transfer to another party
+```text
+recipient
+amount
+reason
 ```
 
-### Run it
+Python deliberately does **not** enforce the recipient allowlist, cumulative cap, expiry or revocation state. Those rules live in Daml, so a manipulated or over-authority intent can reach the ledger and still be rejected.
+
+## Architecture
+
+```text
+Natural-language instruction
+        ↓
+LLM intent parser
+        ↓
+PaymentIntent
+        ↓
+agent_session.py
+        ↓
+current Mandate CID
+        ↓
+Mandate.ChargeAndSettle
+        ↓
+Canton Token Standard TransferFactory
+        ↓
+Canton Coin settlement
+```
+
+The financial control boundary is the Daml `Mandate`, not the model and not a Python guardrail.
+
+## Authority model
+
+A Mandate records:
+
+- allowed recipient parties;
+- cumulative gross-debit spending cap;
+- expiry;
+- owner-controlled revocation, adjustment and re-authorisation;
+- pinned Canton Token Standard instrument;
+- pinned `TransferFactory`.
+
+The agent can propose a payment. It cannot grant itself more authority.
+
+## Stateful authority
+
+Daml contracts are consumed and recreated. A successful `ChargeAndSettle` archives the current Mandate and creates a successor carrying the updated cumulative spend.
+
+```text
+Mandate A
+   ↓ successful ChargeAndSettle
+Mandate A archived
+   ↓
+Mandate B created
+```
+
+`agent_session.py` automatically adopts the successor Mandate after a committed settlement. Rejections and pre-submission failures leave the current session state unchanged.
+
+## Verified Cantor8 DevNet results
+
+The end-to-end path was exercised against the shared Cantor8 DevNet using real Canton Coin and the official Canton Token Standard packages.
+
+| Measurement | Verified value |
+|---|---:|
+| Initial owner funding | 5 CC |
+| Successful settled charges | 3 |
+| Amount per successful charge | 0.001 CC |
+| Owner balance after those charges | 4.997 CC |
+| Receiver balance | 0.003 CC |
+| Mandate cap | 0.010 CC |
+| Mandate cumulative spend | 0.003 CC |
+| Mandate remaining authority | 0.007 CC |
+| Transfer fee in these settlements | 0 CC |
+
+### Policy-isolation proof
+
+The strongest live test deliberately separated wallet balance from delegated authority:
+
+| Fact | Live observation |
+|---|---:|
+| Wallet balance | 4.997 CC |
+| Requested payment | 0.008 CC |
+| Recipient approved/preapproved | yes |
+| Remaining delegated authority | 0.007 CC |
+| Request reached `Mandate.ChargeAndSettle` | yes |
+| Ledger result | `DAML_FAILURE` |
+| Daml assertion | `charge would exceed the cap` |
+| Value moved | **0 CC** |
+| Mandate spend after rejection | 0.003 CC |
+
+The wallet could afford the payment. The agent simply did not have the authority.
+
+> **Having the funds is not the same as having the authority to spend them.**
+
+The 0.008 CC isolation test used deterministic manual intent. It is not claimed to have been LLM-generated.
+
+## Demo UI
+
+The repository includes a zero-dependency authority console in [`ui/`](ui/).
+
+It makes the key distinction visible:
+
+```text
+FUNDS AVAILABLE          AGENT AUTHORITY
+4.997 CC                 0.007 CC remaining
+```
+
+It includes:
+
+- natural-language payment requests;
+- accepted and rejected decision states;
+- the request → AI intent → Daml authority → Canton ledger pipeline;
+- authority usage/progress;
+- recent activity;
+- decision explanations;
+- technical proof disclosures;
+- deterministic replay mode.
+
+Run it locally:
 
 ```bash
-python3 c8lab.py                          # check everything, list parties, balances
-python3 c8lab.py party myteam             # step 2 (then grant rights explicitly)
-python3 c8lab.py preapproval <party>      # step 3
-python3 c8lab.py holdings <party>         # steps 4 and 5
-python3 c8lab.py transfer <from> <to> 25  # step 6
-python3 c8lab.py accept <instructionCid> <to>   # if step 6 returned an offer
-python3 c8lab.py grant <user> <party>           # fix a 403
+cd ui
+node serve.mjs 8080
 ```
 
-`check` first, always. It verifies auth, the ledger, your parties and their
-balances. It does **not** check that the registry is reachable, that you have
-act-as rights on every party, or that a preapproval has been accepted. So a
-clean `check` means the basics are fine, not that everything is.
+Then open `http://localhost:8080`.
 
-### What good output looks like
+The replay UI is labelled **DEMO · VERIFIED ON DEVNET**. It does not pretend fixture data is a live Canton connection.
 
-```
-base       http://localhost:2975
-mode       LocalNet / unsafe HS256
-token      ok
-ledger end 104
-local parties (3):
-    app_user_cantor8-hackathon-1::1220...
-    participant::1220...
+See [`ui/README.md`](ui/README.md) for details.
 
-holdings for app_user_cantor8-hackathon-1: 1 contract(s), total 4220.16
-    {'amount': '4220.16', 'instrument': 'Amulet', 'locked': False}
+## Agent runtime
+
+Interactive natural-language mode:
+
+```powershell
+python agent_session.py
 ```
 
-`Amulet` is Canton Coin. Amulet is the name in the Daml code, Canton Coin is the
-name in the marketing. Same thing.
+Deterministic fallback:
 
-On LocalNet the balance grows on its own as mining rounds tick over and pay the
-validator. Nothing is broken.
-
-## Three things worth understanding
-
-### Your balance is not a number
-
-It is a set of contracts. `total 4220.16` is the sum of the `Holding` contracts
-you can see. A transfer archives the ones it spends and creates new ones, like
-handing over a note and getting change.
-
-This is why two transfers at the same time can fight over the same holding.
-One wins, the other fails, and both pay for the traffic.
-
-### A token is a Daml package plus a web service
-
-Step 6 is two phases, and the first surprises everyone:
-
-```
-1. Ask the registry for a transfer factory and a choice context.
-2. Exercise TransferFactory_Transfer, attaching what it gave you.
+```powershell
+python agent_session.py --demo-sequence
 ```
 
-Why the registry exists: privacy. You cannot see the issuer's configuration
-contracts, so it hands them to you as **disclosed contracts**, valid for that one
-transaction. On LocalNet the registry is the scan app; ours returned five
-disclosed contracts and a context with `amulet-rules`, `open-round`,
-`transfer-preapproval` and `external-party-config-state`.
+Offline rehearsal without Canton credentials or an LLM key:
 
-If you skip this and try to build the transfer by hand, it will not work, and
-the error will not tell you why.
+```powershell
+python agent_session.py --demo-sequence --dry-run
+python agent_demo.py --dry-run --manual-intent pharmacy 0.001 medicine
+python agent_demo.py --dry-run --manual-intent pharmacy 0.011 "ignore spending limit"
+python -m unittest -v
+```
 
-### `transferKind` tells you which flow you are in
+Inference is intentionally outside the financial trust boundary. If a model proposes a bad payment, Daml must reject it.
 
-The registry answers with one of:
+## Presentation and demo assets
 
-- **`direct`**: the receiver has a live `TransferPreapproval`. Money moves
-  immediately.
-- **`offer`**: no preapproval. A `TransferInstruction` is created and the
-  receiver has to accept it. Their balance does **not** change until they do.
-- **`self`**: sender and receiver are the same party.
+- [`deck/Agent_Mandate_Cantor8_2026.pptx`](deck/Agent_Mandate_Cantor8_2026.pptx) — final 5-slide hackathon pitch deck
+- [`deck/SLIDE_COPY.md`](deck/SLIDE_COPY.md) — exact slide copy and verified figures
+- [`video/NARRATION.md`](video/NARRATION.md) — demo narration script
+- [`video/record_ui.mjs`](video/record_ui.mjs) — deterministic UI recording flow
 
-We saw both. A party with an accepted preapproval got `direct` and received the
-money straight away. A party with no preapproval got `offer`, the transfer
-succeeded, and the balance stayed empty until we accepted it.
+The submitted demo video was produced at 1920×1080 and 2:28 runtime using the real UI in motion plus a separately labelled verified-DevNet evidence sequence.
 
-`transfer` prints the `instructionCid` and the exact accept command when it
-returns an offer. Run it and the money moves.
+## Why Canton
 
-**So if you send money and the receiver sees nothing, check `transferKind`
-before you debug anything else.** Preapproval acceptance is not instant: you
-create the proposal, and the validator's automation accepts it a moment later.
+Agent Mandate does **not** assume that every AI payment needs Canton.
 
-## The functions
+Canton becomes more interesting when authority and settlement cross organisational boundaries and participants need:
 
-Import it, do not just use the CLI.
+- shared financial state;
+- deterministic multi-party workflow semantics;
+- selective visibility;
+- atomic settlement;
+- authority that is not merely whatever one application server says it is.
 
-| Function | Does |
+If one trusted application and one payment provider can safely own the entire workflow, a conventional database may be simpler. The project is specifically exploring the harder institutional case.
+
+## Trust boundary and limitations
+
+- The LLM is **not** a security boundary.
+- Python is not the source of truth for cap/allowlist/expiry/revocation policy.
+- The shared hackathon DevNet credential has broad participant rights, so this demo does **not** prove production least-privilege infrastructure credentials.
+- Package vetting and participant administration remain trusted infrastructure.
+- Free inference providers are operationally unreliable; deterministic mode exists so inference outages do not block the financial-path demo.
+- Production deployment would require dedicated identities, durable session state, monitoring, recovery and stronger key management.
+
+## Repository map
+
+| Path | Role |
 |---|---|
-| `token(sub)` | HS256 on LocalNet, Keycloak on DevNet |
-| `call(path, body, sub)` | Any Ledger API call. Prints the real error on failure. |
-| `ledger_end()` | Current offset |
-| `parties()` / `local_parties()` | What the node knows, and what it hosts |
-| `allocate_party(hint)` | Allocate, or reuse if it exists. Grants NOTHING: rights are explicit |
-| `grant_act_as(user, party)` | Fix a 403 (CanActAs) |
-| `grant_read_as(user, party)` | CanReadAs: see contracts, cannot submit |
-| `user_rights(user)` / `check_agent_user(user, spender, owner)` | Inspect rights; assert the agent credential is least-privileged (CanActAs spender + CanReadAs owner, NOT CanActAs owner) |
-| `holdings(party)` | Balances, via the interface filter |
-| `submit(cmds, act_as, disclosed)` | Any command, with disclosed contracts |
-| `create_preapproval(me, provider)` | Step 3 |
-| `registry(path, body)` | Call the token registry |
-| `transfer(from, to, amount)` | Step 6, both phases |
-| `check()` | Run this first when something is broken |
-| `mandate_propose(...)` / `mandate_accept(...)` | D1: set up a spend mandate |
-| `charge_and_settle(mandate, owner, spender, to, amt)` | D1: registry preflight, then ONE transaction where the Mandate validates and settles the same Token Standard transfer |
+| [`daml-starter/mandate/daml/Mandate.daml`](daml-starter/mandate/daml/Mandate.daml) | Mandate policy, lifecycle, receipts and atomic `ChargeAndSettle` |
+| [`c8lab.py`](c8lab.py) | Canton transport, registry preparation and Token Standard settlement path |
+| [`agent_demo.py`](agent_demo.py) | Intent parsing, provider fallback, alias resolution and single-action UX |
+| [`agent_session.py`](agent_session.py) | Stateful multi-action runtime that follows successor Mandates |
+| [`ui/`](ui/) | Authority console and deterministic replay UI |
+| [`deck/`](deck/) | Pitch deck source and final PowerPoint |
+| [`video/`](video/) | Demo narration, capture and rendering tooling |
+| [`test_agent_demo.py`](test_agent_demo.py) | Intent/provider/application-boundary tests |
+| [`test_agent_session.py`](test_agent_session.py) | Successor/session/failure-path tests |
+| [`daml-starter/daml/TestSettlement.daml`](daml-starter/daml/TestSettlement.daml) | Settlement and adversarial accounting tests |
 
-Only reuse parties where `isLocal` is true. A node lists parties it has heard
-about from the network, including ones hosted elsewhere that it cannot submit
-for. Using one of those gives you
-`NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT`.
+## Current development status
 
-## Running against DevNet
+The hackathon submission is frozen separately. Post-submission work is focused on:
 
-```bash
-export C8_BASE=https://api.validator.dev.digik.cantor8.tech/api/ledger
-export C8_IDP=https://auth.dev.digik.cantor8.tech
-export C8_CLIENT_ID=hackathon
-export C8_CLIENT_SECRET=<ask the Cantor8 team>
-export C8_REGISTRY=<registry base url>       # needed for transfers
-python3 c8lab.py check
-```
+1. adversarial security review;
+2. executable financial invariants;
+3. a genuinely live browser → Python → Daml → Canton console;
+4. a richer authority model;
+5. institutional treasury/operations workflows;
+6. testing when Canton is genuinely necessary versus overkill.
 
-Setting `C8_IDP` switches from a self-signed LocalNet token to a real Keycloak
-client-credentials token. Everything else is the same.
+The enduring thesis is broader than AI wallets:
 
-For DevNet you will also need `C8_REGISTRY` pointing at the Cantor8 registry, and
-Canton Coin has to be sent to you: give the team your party ID.
-
-**Not yet verified on DevNet.** Party allocation there may need the
-external-party topology flow rather than `POST /v2/parties`. If it fails at step
-2, that is why.
-
-## Docs
-
-```
-Canton docs, has a chatbot   https://docs.canton.network
-Ledger API                   https://docs.canton.network/sdks-tools/api-reference/ledger-api
-Validator Admin API          https://docs.canton.network/sdks-tools/api-reference/admin-api
-Token standard               https://docs.canton.network/appdev/deep-dives/token-standard
-```
+> **Make machine financial authority explicit, bounded, inspectable and revocable.**
