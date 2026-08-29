@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<!-- Capture harness: loads the real UI in an iframe and deterministically
+     drives its demo flows so headless Edge can screenshot end states.
+     Query: ?flow=idle | accepted | rejected
+       idle     — freshly loaded console
+       accepted — chip 1 flow completed (SETTLED, counters advanced)
+       rejected — chip 1 then chip 2 (hero rejection at 4.996 CC funds)
+     The UI itself is untouched; this file only dispatches clicks. -->
+<head>
+<meta charset="utf-8">
+<title>capture</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0c0e; }
+  iframe { display: block; width: 100vw; height: 100vh; border: 0; }
+</style>
+</head>
+<body>
+<iframe id="ui" src="/ui/index.html"></iframe>
+<script type="module">
+  const flow = new URLSearchParams(location.search).get("flow") ?? "idle";
+  const ui = document.getElementById("ui");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  ui.addEventListener("load", async () => {
+    const doc = ui.contentDocument;
+    // Disable the rAF counter tween entirely: under virtual time its
+    // frames strand at interpolated values. End values are pinned below.
+    ui.contentWindow.requestAnimationFrame = () => 0;
+    const chips = doc.querySelectorAll(".chip");
+    await sleep(600); // initial render settles
+    if (flow === "accepted" || flow === "rejected") {
+      chips[0].click();
+      await sleep(5200); // pipeline + settle + counter tween complete
+    }
+    if (flow === "rejected") {
+      chips[1].click();
+      await sleep(5200); // pipeline + rejection render complete
+    }
+    // Freeze at the end state: virtual-time screenshots can otherwise
+    // catch entry animations mid-fade.
+    const freeze = doc.createElement("style");
+    freeze.textContent = "*{animation:none!important;transition:none!important}";
+    doc.head.appendChild(freeze);
+    // The counter tween runs on requestAnimationFrame, which virtual
+    // time can strand mid-flight. Pin the deterministic end state the
+    // runtime reaches in real time (asserted by ui/test: 4.997→4.996,
+    // spent 0.003→0.004, remaining 0.007→0.006 after the 0.001 settle).
+    if (flow === "accepted" || flow === "rejected") {
+      const set = (id, v) => { doc.getElementById(id).textContent = v; };
+      set("wallet", "4.996");
+      set("spent", "0.004");
+      set("remaining", "0.006");
+      doc.getElementById("authbar-fill").style.width = "40%";
+    }
+    await sleep(300);
+    document.title = "capture-ready";
+  });
+</script>
+</body>
+</html>
