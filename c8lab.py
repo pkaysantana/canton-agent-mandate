@@ -456,9 +456,12 @@ def charge_and_settle(mandate_cid, owner, spender, receiver, amount,
 
 
 def _find_created(res, template_suffix):
+    # Match on a ':' boundary: "Mandate:Mandate" is a substring of
+    # "Mandate:MandateProposal", so a plain `in` check could return the
+    # wrong contract if one transaction ever created both.
     for ev in res.get("transaction", {}).get("events", []):
         created = ev.get("CreatedTreeEvent", {}).get("value") or ev.get("CreatedEvent")
-        if created and template_suffix in str(created.get("templateId", "")):
+        if created and str(created.get("templateId", "")).endswith(":" + template_suffix):
             return created.get("contractId")
     return None
 

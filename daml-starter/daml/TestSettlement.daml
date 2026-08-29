@@ -8,9 +8,8 @@
 -- itself, the mandate lifecycle, and the authority model.
 module TestSettlement where
 
-import DA.Time (addRelTime, hours, minutes)
 import DA.Date (Month(Jan), date)
-import DA.Time (time)
+import DA.Time (addRelTime, hours, minutes, time)
 import Daml.Script
 import Mandate
 import Splice.Api.Token.MetadataV1
