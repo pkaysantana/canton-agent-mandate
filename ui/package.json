@@ -1,0 +1,11 @@
+{
+  "name": "agent-mandate-ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Agent Mandate demo console — zero-dependency static UI",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/mandate.test.mjs",
+    "start": "node serve.mjs 8080"
+  }
+}
