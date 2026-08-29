@@ -383,9 +383,18 @@ def charge_and_settle(mandate_cid, owner, spender, receiver, amount,
     TransferFactory_Transfer on that same record. The registry cannot be
     lied to about what was authorised, because there is only one object.
 
-    Returns transferKind ('direct': money moved; 'offer': a pending
-    TransferInstruction the receiver must accept - money has NOT moved yet),
-    plus the receipt and successor mandate contract ids.
+    CREDENTIALS: the agent service needs CanActAs(spender) and, to read the
+    owner's holdings, CanReadAs(owner). It must NOT have CanActAs(owner) -
+    with that it could transfer directly and the mandate would be decoration.
+    The owner's authority to move funds comes from the mandate contract, not
+    from this submission.
+
+    Only the direct path is supported: if the registry says the receiver has
+    no preapproval ('offer'), this refuses before submitting, because the
+    mandate would abort the transaction anyway rather than record a pending
+    transfer as if money had moved.
+
+    Returns the receipt and successor mandate contract ids.
     """
     if not REGISTRY:
         raise LabError("settlement needs C8_REGISTRY. See README.md.")
@@ -416,6 +425,13 @@ def charge_and_settle(mandate_cid, owner, spender, receiver, amount,
                        "expectedAdmin": admin, "transfer": transfer,
                        "extraArgs": {"context": {"values": {}},
                                      "meta": {"values": {}}}}})
+    if fac.get("transferKind") == "offer":
+        raise LabError(
+            f"receiver {receiver} has no accepted TransferPreapproval, so "
+            "this would only create a pending offer and the mandate refuses "
+            "those. Fix:\n"
+            f"  python3 c8lab.py preapproval {receiver}\n"
+            "wait a moment for the validator to accept it, then retry.")
     cc = fac.get("choiceContext", {})
 
     # Daml begins here: one command, one transaction, policy and settlement
@@ -433,12 +449,10 @@ def charge_and_settle(mandate_cid, owner, spender, receiver, amount,
                  act_as=spender, read_as=owner, sub=sub,
                  disclosed=cc.get("disclosedContracts", []),
                  want_transaction=True)
-    out = {"transferKind": fac.get("transferKind"),
-           "receiptCid": _find_created(res, "Mandate:ChargeReceipt"),
-           "mandateCid": _find_created(res, "Mandate:Mandate"),
-           "instructionCid": _find_instruction_cid(res),
-           "result": res}
-    return out
+    return {"transferKind": fac.get("transferKind"),
+            "receiptCid": _find_created(res, "Mandate:ChargeReceipt"),
+            "mandateCid": _find_created(res, "Mandate:Mandate"),
+            "result": res}
 
 
 def _find_created(res, template_suffix):
@@ -556,10 +570,8 @@ def main():
             print(f"transferKind {out['transferKind']}")
             print(f"receipt      {out['receiptCid']}")
             print(f"mandate      {out['mandateCid']}")
-            if out["transferKind"] == "offer":
-                print(f"\nThe transfer is PENDING, the receiver has not been "
-                      f"paid yet.\nAccept it with:\n  python3 c8lab.py accept "
-                      f"{out['instructionCid']} {a.receiver}")
+            print("\nSettled: the receiver holds the funds. If this had been "
+                  "an offer, it\nwould have been refused before submission.")
     except LabError as e:
         print(f"\nERROR: {e}", file=sys.stderr)
         sys.exit(1)

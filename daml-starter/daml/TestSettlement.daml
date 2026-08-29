@@ -157,39 +157,41 @@ testSettleDirect = script do
   aliceHoldings <- query @MockHolding alice
   assert (sum (map (\(_, h) -> h.amount) aliceHoldings) == 950.0)
 
--- | The offer path: the receiver has no preapproval, so the Token Standard
--- result is Pending. The receipt must say so, NOT claim money moved. The
--- allowance is consumed at authorisation time: the sender's funds are
--- committed from this moment even though the receiver has not accepted.
-testSettlePending : Script ()
-testSettlePending = script do
+-- | The offer path: the receiver has no preapproval, so the registry would
+-- only create a pending TransferInstruction - value would NOT move. The
+-- mandate refuses: the whole transaction rolls back, no allowance is
+-- consumed, no receipt exists, the sender's holdings are untouched. A
+-- committed ChargeAndSettle therefore always means the receiver was paid.
+testSettlePendingAborts : Script ()
+testSettlePendingAborts = script do
   s@Setup{..} <- mkSetup
   now <- getTime
 
-  let t = mkTransfer inst alice carol 25.0 [holdingCid] now
-  (m2, rCid, res) <- submit agent do
+  -- carol is on the allow-list but has no preapproval.
+  submitMustFail agent do
     exerciseCmd mandateCid ChargeAndSettle with
-      factoryCid; transfer = t; extraArgs = emptyExtra
+      factoryCid
+      transfer = mkTransfer inst alice carol 25.0 [holdingCid] now
+      extraArgs = emptyExtra
 
-  icid <- case res.output of
-    TransferInstructionResult_Pending { transferInstructionCid } ->
-      pure transferInstructionCid
-    _ -> abort "expected a pending instruction for a non-preapproved receiver"
+  -- Nothing happened, anywhere.
+  carolHoldings <- query @MockHolding carol
+  assert (null carolHoldings)
+  aliceHoldings <- query @MockHolding alice
+  assert (sum (map (\(_, h) -> h.amount) aliceHoldings) == 1000.0)
+  Some m <- queryContractId alice mandateCid
+  assert (m.spent == 0.0 && m.charges == 0)
+  receipts <- query @ChargeReceipt alice
+  assert (null receipts)
 
-  -- Carol has NOT been paid yet, and the receipt does not pretend she was.
-  carolBefore <- query @MockHolding carol
-  assert (null carolBefore)
+  -- The mandate is still perfectly usable for a direct-path receiver.
+  (_, rCid, _) <- submit agent do
+    exerciseCmd mandateCid ChargeAndSettle with
+      factoryCid
+      transfer = mkTransfer inst alice bob 25.0 [holdingCid] now
+      extraArgs = emptyExtra
   Some r <- queryContractId alice rCid
-  assert (r.settlement == PendingInstruction icid)
-  -- The allowance is committed regardless.
-  Some m <- queryContractId alice m2
-  assert (m.spent == 25.0)
-
-  -- Carol accepts; only now does the money reach her.
-  _ <- submit carol do
-    exerciseCmd icid TransferInstruction_Accept with extraArgs = emptyExtra
-  carolAfter <- query @MockHolding carol
-  assert (sum (map (\(_, h) -> h.amount) carolAfter) == 25.0)
+  assert (r.settlement == Settled)
 
 -- | Everything a malicious caller might try against the settled path. Each
 -- attack is a variation of the ONE transfer object, because that is the only

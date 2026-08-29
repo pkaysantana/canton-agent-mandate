@@ -22,7 +22,7 @@ daml/Test.daml:testMandateHappyPath: ok, 3 active contracts, 4 transactions.
 daml/Test.daml:testIou: ok, 1 active contracts, 4 transactions.
 daml/TestSettlement.daml:testNestedAuthority: ok, 7 active contracts, 9 transactions.
 daml/TestSettlement.daml:testSettleDirect: ok, 7 active contracts, 6 transactions.
-daml/TestSettlement.daml:testSettlePending: ok, 5 active contracts, 6 transactions.
+daml/TestSettlement.daml:testSettlePendingAborts: ok, 5 active contracts, 6 transactions.
 daml/TestSettlement.daml:testSettleAdversarial: ok, 9 active contracts, 20 transactions.
 daml/TestSettlement.daml:testSettleAfterRevocation: ok, 2 active contracts, 6 transactions.
 daml/TestSettlement.daml:testSettleAfterExpiry: ok, 5 active contracts, 10 transactions.
@@ -100,9 +100,28 @@ disclosed contracts) happens off-ledger before submission; see
 Receipts carry a `settlement` field that tells the truth about the money:
 
 - `AuthorisedOnly`: `Charge`, nothing moved.
-- `Settled`: direct path, the receiver holds the funds.
-- `PendingInstruction cid`: offer path, a `TransferInstruction` is waiting
-  for the receiver to accept. The funds are committed but have NOT arrived.
+- `Settled`: the receiver holds the funds, paid in that same transaction.
+
+There is deliberately no pending state. If the receiver has no preapproval
+the registry can only create a pending `TransferInstruction`, so
+`ChargeAndSettle` aborts instead: a committed settlement always means the
+receiver was paid, and a refused one consumed no allowance. The Python
+helper refuses before even submitting, with instructions to set up the
+receiver's preapproval.
+
+Two things the code states explicitly rather than hides:
+
+- **Cap semantics under fees.** The cap bounds `transfer.amount`, what the
+  recipient receives. Registries may take fees out of the input holdings on
+  top (Amulet does), so the owner's gross debit can exceed the sum of
+  receipted amounts. The cap limits what the agent directs at
+  counterparties, not the owner's total outflow.
+- **Completed is trusted, not re-fetched.** The mandate does not fetch the
+  receiver's new holdings to double-check them: a fetch must be authorised
+  by a stakeholder of the fetched contract, and those fresh holdings have
+  only the receiver and the registry admin as stakeholders. That is the
+  ledger model, not a missing package. `Completed` is the Token Standard's
+  own guarantee, from the same vetted registry code that moved the money.
 
 `TestToken.daml` is a mock registry implementing the real
 `splice-api-token-*-v1` interfaces so `daml test` can prove all of this
@@ -126,10 +145,10 @@ enforces.
 
 - **Per-period caps.** "100 per month" rather than 100 in total. Harder than it
   looks because of date arithmetic. The total cap works; build on it.
-- **Allowance release on rejection.** A `PendingInstruction` consumes
-  allowance when it is created. If the receiver rejects or the sender
-  withdraws, the funds come back but the allowance does not. Deliberate
-  (conservative), but a refund choice would be a real improvement.
+- **Offer-path support.** Today the mandate settles direct transfers only and
+  aborts when the receiver lacks a preapproval. Supporting pending
+  instructions properly means deciding when allowance is consumed and
+  refunded across accept/reject/withdraw - a real design task, not a patch.
 
 ## Three things that catch people
 
