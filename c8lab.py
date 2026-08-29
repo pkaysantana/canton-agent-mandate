@@ -12,6 +12,11 @@ DevNet:
     export C8_REGISTRY=https://<registry-host>        # needed for transfers
     python3 c8lab.py check
 
+If this Python's TLS stack cannot reach Keycloak, fetch the short-lived
+bearer token with any client that can and export it into this process's
+environment as C8_ACCESS_TOKEN; token() then uses it verbatim and skips
+the client-credentials call. It is never printed and never touches disk.
+
 Canton Coin on DevNet is served by the SV scan proxy, which uses the plain
 Splice paths and the DSO as admin, so it needs nothing extra:
     export C8_REGISTRY=https://sv-proxy.dev.digik.cantor8.tech
@@ -23,11 +28,17 @@ prefixes every route, and their admin is not the DSO:
     export C8_ADMIN_PARTY=cantor8-digik-1::1220...
     python3 c8lab.py transfer alice bob 5 --instrument c8TEST
 """
-import argparse, base64, datetime, hmac, hashlib, json, os, sys, uuid
+import argparse, base64, datetime, hmac, hashlib, http.client, json, os
+import socket, sys, uuid
 import urllib.error, urllib.parse, urllib.request
 
 BASE     = os.environ.get("C8_BASE", "http://localhost:2975")
 IDP      = os.environ.get("C8_IDP")                    # set => DevNet mode
+# Escape hatch for broken client TLS stacks: obtain the short-lived bearer
+# token out-of-band (e.g. PowerShell on the Windows TLS stack), export it
+# into THIS process's environment only, and every call uses it as-is.
+# Never logged, never written to disk.
+ACCESS_TOKEN = os.environ.get("C8_ACCESS_TOKEN")
 CID      = os.environ.get("C8_CLIENT_ID", "hackathon")
 CSEC     = os.environ.get("C8_CLIENT_SECRET")
 SECRET   = os.environ.get("C8_JWT_SECRET", "unsafe").encode()
@@ -64,6 +75,8 @@ class LabError(Exception):
 
 
 def token(sub=USER):
+    if ACCESS_TOKEN:
+        return ACCESS_TOKEN
     if IDP:
         if not CSEC:
             raise LabError("C8_IDP is set but C8_CLIENT_SECRET is not.")
@@ -84,6 +97,48 @@ def token(sub=USER):
     p = b(json.dumps({"sub": sub, "aud": AUD}, separators=(",", ":")).encode())
     s = b(hmac.new(SECRET, h + b"." + p, hashlib.sha256).digest())
     return (h + b"." + p + b"." + s).decode()
+
+
+class _AllAddrsHTTPSConnection(http.client.HTTPSConnection):
+    """The DevNet hostnames resolve to several load-balanced addresses, and
+    one backend forcibly resets TLS handshakes from OpenSSL clients
+    (WinError 10054) while the rest are fine. Stock urllib commits to a
+    single address, so whether anything works depends on resolver order.
+    Try every resolved address before failing. Certificate and hostname
+    verification are the stdlib defaults, unchanged; only connection
+    establishment is retried, never a request that already went out."""
+
+    def connect(self):
+        last_err = None
+        for *_, addr in socket.getaddrinfo(self.host, self.port,
+                                           type=socket.SOCK_STREAM):
+            try:
+                self.sock = socket.create_connection(
+                    addr, self.timeout, self.source_address)
+                try:
+                    if self._tunnel_host:
+                        self._tunnel()
+                    self.sock = self._context.wrap_socket(
+                        self.sock,
+                        server_hostname=self._tunnel_host or self.host)
+                    return
+                except OSError:
+                    self.sock.close()
+                    self.sock = None
+                    raise
+            except OSError as e:
+                last_err = e
+        raise last_err or OSError(f"no addresses resolved for {self.host}")
+
+
+class _AllAddrsHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_AllAddrsHTTPSConnection, req,
+                            context=self._context)
+
+
+urllib.request.install_opener(
+    urllib.request.build_opener(_AllAddrsHTTPSHandler))
 
 
 def _request(url, body=None, headers=None, method=None, timeout=30):
@@ -586,7 +641,8 @@ def check():
     if IDP or ADMIN_PARTY:
         print(f"admin      {ADMIN_PARTY or '(DSO, correct for Amulet only)'}")
     token()
-    print("token      ok")
+    print("token      ok" + (" (pre-acquired via C8_ACCESS_TOKEN)"
+                             if ACCESS_TOKEN else ""))
     print(f"ledger end {ledger_end()}")
     ps = local_parties()
     print(f"local parties ({len(ps)}):")
