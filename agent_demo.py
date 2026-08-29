@@ -212,6 +212,13 @@ def parse_intent_json(raw: str) -> PaymentIntent:
     return _validate_intent_object(value)
 
 
+def parse_manual_intent(values: list[str] | tuple[str, str, str]) -> PaymentIntent:
+    recipient, amount, reason = values
+    return _validate_intent_object(
+        {"recipient": recipient, "amount": amount, "reason": reason}
+    )
+
+
 def request_intent(provider: Provider, instruction: str, timeout: float) -> PaymentIntent:
     """Call one OpenAI-compatible chat endpoint with strict JSON Schema."""
     body = {
@@ -436,7 +443,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--manual-json",
         metavar="JSON",
-        help="deterministic payment intent; bypasses inference only",
+        help="programmatic deterministic payment intent; bypasses inference only",
+    )
+    parser.add_argument(
+        "--manual-intent",
+        nargs=3,
+        metavar=("RECIPIENT", "AMOUNT", "REASON"),
+        help="shell-safe deterministic payment intent; bypasses inference only",
     )
     parser.add_argument(
         "--dry-run",
@@ -454,15 +467,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if bool(args.instruction) == bool(args.manual_json):
-        print("ERROR: provide exactly one instruction or --manual-json", file=sys.stderr)
+    modes = sum(
+        value is not None
+        for value in (args.instruction, args.manual_json, args.manual_intent)
+    )
+    if modes != 1:
+        print(
+            "ERROR: provide exactly one instruction, --manual-intent, or --manual-json",
+            file=sys.stderr,
+        )
         return 2
     if args.timeout <= 0:
         print("ERROR: --timeout must be greater than zero", file=sys.stderr)
         return 2
     try:
         aliases, synthetic_aliases = aliases_from_env(dry_run=args.dry_run)
-        if args.manual_json:
+        if args.manual_intent is not None:
+            intent = parse_manual_intent(args.manual_intent)
+        elif args.manual_json is not None:
             intent = parse_intent_json(args.manual_json)
         else:
             intent, _provider = infer_intent(
@@ -483,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except InferenceUnavailable:
         print("inference unavailable", file=sys.stderr)
-        print("use --manual-json for deterministic demo", file=sys.stderr)
+        print("use --manual-intent for deterministic demo", file=sys.stderr)
         return 2
     except RuntimeErrorBase as exc:
         print(f"ERROR: {_safe_error_text(exc)}", file=sys.stderr)
