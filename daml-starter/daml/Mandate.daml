@@ -1,52 +1,85 @@
--- Starter for the mandate task (D3 direct debit / D4 agent wallet).
+-- D1: a spend-limited wallet for an AI agent.
 --
--- One party lets another spend up to a cap, until a deadline, and can revoke
--- at any time. Same contract either way: for D3 the spender is a merchant,
--- for D4 it is an AI agent.
+-- One party (the owner) lets another (the spender: an AI agent, or a merchant
+-- in the D3 direct-debit framing) spend up to a cap, only with named
+-- counterparties, only until a deadline, revocable instantly.
 --
--- The point of the task: the cap is enforced HERE, in Daml. Not in your API.
--- A cap checked in Python is a suggestion. A cap in a choice body is a rule.
+-- The point of the task: every limit is enforced HERE, in Daml. A cap checked
+-- in Python is a suggestion; a cap in a choice body is a rule the network
+-- enforces, including against a spender who talks to the Ledger API directly.
 --
--- What to build on top:
---   * move real value: make Charge exercise a token transfer, not just record it
---   * an allow-list of counterparties the spender may pay
---   * per-period reset (harder than it looks, do the total cap first)
---   * an audit view of every charge
+-- SETTLEMENT IS OUT OF SCOPE ON THIS BRANCH. `Charge` authorises spending and
+-- writes an on-ledger receipt; it does not move Canton Coin. Real Token
+-- Standard settlement (exercising TransferFactory_Transfer with the registry's
+-- disclosed contracts, see ../../README.md) will be integrated separately once
+-- the DevNet architecture is confirmed with Cantor8. Nothing here pretends
+-- value has moved: a ChargeReceipt records an *authorisation*, not a payment.
 module Mandate where
 
+import DA.List (unique)
 
+
+-- | A mandate is the policy. It is created by Accept on a proposal, and every
+-- Charge archives it and recreates it with the new `spent` total, so the
+-- remaining allowance is always the ledger's own state, never a cached number.
 template Mandate
   with
-    owner    : Party      -- who is paying
-    spender  : Party      -- merchant, or agent
-    cap      : Decimal    -- total they may spend over the mandate's life
-    spent    : Decimal    -- how much so far
+    owner     : Party        -- who is paying
+    spender   : Party        -- the agent, or merchant
+    allowed   : [Party]      -- the only counterparties the spender may pay
+    cap       : Decimal      -- total they may spend over the mandate's life
+    spent     : Decimal      -- how much so far
     expiresAt : Time
+    mandateId : Text         -- stable across the archive/recreate chain
+    charges   : Int          -- how many charges have been authorised
   where
-    ensure cap > 0.0 && spent >= 0.0 && spent <= cap
+    -- Checked on every create, so no future choice can break these.
+    ensure cap > 0.0
+        && spent >= 0.0
+        && spent <= cap
+        && charges >= 0
+        && owner /= spender
+        && not (null allowed)
+        && unique allowed
+        -- An agent that may pay itself is an agent that may drain the cap to
+        -- an account it controls. The owner is excluded for the same reason:
+        -- paying the owner is not spending.
+        && spender `notElem` allowed
+        && owner `notElem` allowed
 
-    -- Both must agree it exists. The owner cannot be signed up without
+    -- Both must agree it exists: the owner cannot be signed up without
     -- consenting, and the spender cannot be bound without consenting.
     signatory owner, spender
 
-    -- Spend within the mandate. No owner signature needed, that is the point.
-    choice Charge : ContractId Mandate
-      with amount : Decimal
+    -- | Authorise spending within the policy. No owner signature: that is the
+    -- whole point of a mandate. Returns the successor mandate and the receipt.
+    choice Charge : (ContractId Mandate, ContractId ChargeReceipt)
+      with
+        recipient : Party
+        amount    : Decimal
       controller spender
       do
         now <- getTime
-        -- Deadlines are NOT enforced for you. Check them yourself.
+        -- Deadlines are NOT enforced for you.
         assertMsg "mandate expired" (now < expiresAt)
         assertMsg "amount must be positive" (amount > 0.0)
         assertMsg "charge would exceed the cap" (spent + amount <= cap)
-        create this with spent = spent + amount
+        assertMsg "recipient is not on the allow-list" (recipient `elem` allowed)
+        let spentAfter = spent + amount
+        m <- create this with spent = spentAfter; charges = charges + 1
+        r <- create ChargeReceipt with
+              owner; spender; recipient; amount
+              chargedAt = now
+              mandateId
+              sequence = charges + 1
+              capAtCharge = cap
+              spentAfter
+              expiresAtAtCharge = expiresAt
+        pure (m, r)
 
-    -- The owner can always stop it, and the spender cannot block that.
-    choice Revoke : ()
-      controller owner
-      do pure ()
-
-    -- Raising the cap needs both parties, because both are signatories.
+    -- | Change the cap. Both parties are signatories, so the spender cannot
+    -- raise its own cap and the owner cannot raise the spender's obligation
+    -- unilaterally either.
     choice Adjust : ContractId Mandate
       with newCap : Decimal
       controller owner, spender
@@ -54,15 +87,58 @@ template Mandate
         assertMsg "new cap below what is already spent" (newCap >= spent)
         create this with cap = newCap
 
+    -- | Change the allow-list. Both signatures, for the same reason as Adjust:
+    -- an agent that can add counterparties has no allow-list.
+    choice Reauthorise : ContractId Mandate
+      with newAllowed : [Party]
+      controller owner, spender
+      do create this with allowed = newAllowed
 
--- Propose and accept: the most common shape in Daml.
--- You cannot force a contract on someone who has to sign it, and you are
--- rarely online at the same time. So you offer, and they accept later.
+    -- | The owner stops it, immediately and unilaterally. The spender is a
+    -- signatory of the mandate but is not a controller here, so it can neither
+    -- block nor delay this, and the archive takes effect in the same
+    -- transaction.
+    choice Revoke : ()
+      controller owner
+      do pure ()
+
+
+-- | The audit trail: one immutable contract per authorised charge, signed by
+-- both mandate parties and visible to the counterparty that was paid.
+--
+-- It answers "what did the agent do, and which permission allowed it": the
+-- policy is identified by `mandateId` (stable across the mandate's
+-- archive/recreate chain) and the limits actually in force at that moment are
+-- copied in, so a later Adjust cannot rewrite history.
+--
+-- It has no choices: an audit record that can be edited is not one. Archiving
+-- still needs both signatories, so neither party can quietly delete evidence.
+template ChargeReceipt
+  with
+    owner             : Party
+    spender           : Party
+    recipient         : Party
+    amount            : Decimal
+    chargedAt         : Time
+    mandateId         : Text     -- the policy that authorised this charge
+    sequence          : Int      -- 1-based, in charge order within the mandate
+    capAtCharge       : Decimal
+    spentAfter        : Decimal  -- cumulative spend including this charge
+    expiresAtAtCharge : Time
+  where
+    ensure amount > 0.0 && sequence > 0 && spentAfter <= capAtCharge
+    signatory owner, spender
+    observer recipient
+
+
+-- | Propose and accept: you cannot force a contract on someone who has to sign
+-- it, and the two are rarely online together.
 template MandateProposal
   with
-    owner    : Party
-    spender  : Party
-    cap      : Decimal
+    owner     : Party
+    spender   : Party
+    allowed   : [Party]
+    cap       : Decimal
     expiresAt : Time
   where
     signatory owner
@@ -70,7 +146,15 @@ template MandateProposal
 
     choice Accept : ContractId Mandate
       controller spender
-      do create Mandate with owner; spender; cap; spent = 0.0; expiresAt
+      do
+        -- The proposal's contract id is the mandate's stable identity: it is
+        -- unique on the ledger and survives every Charge, which archives the
+        -- mandate and creates its successor.
+        create Mandate with
+          owner; spender; allowed; cap; expiresAt
+          spent = 0.0
+          mandateId = show self
+          charges = 0
 
     choice Reject : ()
       controller spender
