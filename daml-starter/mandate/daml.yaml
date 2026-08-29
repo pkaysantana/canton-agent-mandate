@@ -1,0 +1,20 @@
+# The DEPLOYABLE package: Mandate only. No daml-script, no tests, no mocks.
+# This is the DAR that goes to DevNet: .daml/dist/agent-mandate-0.1.0.dar
+#
+# Compiled against the OFFICIAL Cantor8 DevNet Token Standard interface DARs
+# in ../token-standard/official/ - never against the source rebuilds in
+# ../token-standard/splice-api-* (kept as readable reference only), whose
+# package-ids do not match the network.
+sdk-version: 3.4.10
+name: agent-mandate
+source: daml
+version: 0.1.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - ../token-standard/official/splice-api-token-metadata-v1-1.0.0.dar
+  - ../token-standard/official/splice-api-token-holding-v1-1.0.0.dar
+  - ../token-standard/official/splice-api-token-transfer-instruction-v1-1.0.0.dar
+build-options:
+  - --target=2.1

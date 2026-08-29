@@ -1,0 +1,328 @@
+-- A minimal Token Standard registry implementation, FOR TESTS ONLY.
+--
+-- `daml test` has no Amulet and no registry HTTP service, so proving the
+-- mandate's settlement path needs a stand-in that implements the real
+-- interfaces: `Holding`, `TransferFactory`, `TransferInstruction`. The
+-- interface types are the genuine `splice-api-token-*-v1` packages, so the
+-- mandate code under test is byte-for-byte the code that talks to a real
+-- registry; only the implementation behind the interface is mocked.
+--
+-- The mock mirrors the semantics that matter to the mandate:
+--   * `TransferFactory_Transfer` is controlled by `transfer.sender`, so the
+--     authority question is the real one.
+--   * inputs must be holdings owned by the sender in the right instrument,
+--     and are archived (spent) by the transfer, with change returned.
+--   * a receiver on the `preapproved` list settles directly (Completed);
+--     anyone else gets a pending `TransferInstruction` they must accept,
+--     exactly like Amulet's direct/offer split.
+module TestToken where
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.TransferInstructionV1
+
+-- | A single fungible position. Signed by the registry admin alone so the
+-- registry can mint, burn and move positions inside its own choice bodies,
+-- like Amulet does; the owner sees it, plus anyone in `observers` (the test's
+-- stand-in for "hosted on the same participant").
+template MockHolding
+  with
+    admin        : Party
+    owner        : Party
+    instrumentId : InstrumentId
+    amount       : Decimal
+    observers    : [Party]
+  where
+    ensure amount > 0.0
+    signatory admin
+    observer owner, observers
+
+    interface instance Holding for MockHolding where
+      view = HoldingView with
+        owner; instrumentId; amount
+        lock = None
+        meta = emptyMetadata
+
+-- | The registry's transfer factory. In production this arrives as a
+-- disclosed contract from the registry's HTTP preflight; in tests it is
+-- shared via `observers`.
+template MockTransferFactory
+  with
+    admin       : Party
+    observers   : [Party]
+    preapproved : [Party]  -- receivers with a standing preapproval: direct
+    fee         : Decimal  -- flat fee the registry keeps per transfer,
+                           -- taken from the sender's inputs like Amulet does
+  where
+    ensure fee >= 0.0
+    signatory admin
+    observer observers
+
+    interface instance TransferFactory for MockTransferFactory where
+      view = TransferFactoryView with admin; meta = emptyMetadata
+
+      transferFactory_publicFetchImpl _self arg = do
+        assertMsg "factory: expectedAdmin does not match" (arg.expectedAdmin == admin)
+        pure TransferFactoryView with admin; meta = emptyMetadata
+
+      transferFactory_transferImpl _self arg = do
+        let t = arg.transfer
+        now <- getTime
+        assertMsg "factory: expectedAdmin does not match" (arg.expectedAdmin == admin)
+        assertMsg "factory: instrument admin mismatch" (t.instrumentId.admin == admin)
+        assertMsg "factory: executeBefore must be in the future" (now < t.executeBefore)
+        assertMsg "factory: requestedAt must not be in the future" (t.requestedAt <= now)
+        assertMsg "factory: input holdings required" (not (null t.inputHoldingCids))
+        -- Spend the inputs: they must be the sender's, in this instrument.
+        spentInputs <- forA t.inputHoldingCids $ \hCid -> do
+          fetched <- fetchFromInterface @MockHolding hCid
+          case fetched of
+            None -> abort "factory: input is not a holding of this registry"
+            Some (cid, h) -> do
+              assertMsg "factory: input not owned by sender" (h.owner == t.sender)
+              assertMsg "factory: input instrument mismatch" (h.instrumentId == t.instrumentId)
+              archive cid
+              pure h
+        let total = sum (map (\h -> h.amount) spentInputs)
+        assertMsg "factory: insufficient funds" (total >= t.amount + fee)
+        -- Change keeps the inputs' observers, so whoever could see the funds
+        -- before the transfer (in these tests: the agent's wallet view) can
+        -- still see them after. Divulgence alone would not be enough: Canton
+        -- does not let a party reuse a contract it merely witnessed.
+        senderChangeCids <-
+          if total > t.amount + fee
+            then do
+              cid <- create MockHolding with
+                admin
+                owner = t.sender
+                instrumentId = t.instrumentId
+                amount = total - t.amount - fee
+                observers = concatMap (\h -> h.observers) spentInputs
+              pure [toInterfaceContractId @Holding cid]
+            else pure []
+        if t.receiver `elem` preapproved
+          then do
+            rcid <- create MockHolding with
+              admin
+              owner = t.receiver
+              instrumentId = t.instrumentId
+              amount = t.amount
+              observers = []
+            pure TransferInstructionResult with
+              output = TransferInstructionResult_Completed with
+                receiverHoldingCids = [toInterfaceContractId @Holding rcid]
+              senderChangeCids
+              meta = emptyMetadata
+          else do
+            icid <- create MockTransferInstruction with admin; transfer = t
+            pure TransferInstructionResult with
+              output = TransferInstructionResult_Pending with
+                transferInstructionCid = toInterfaceContractId @TransferInstruction icid
+              senderChangeCids
+              meta = emptyMetadata
+
+-- | The pending state of an offer-path transfer: the sender's funds are
+-- already committed (their inputs were archived), the receiver has not been
+-- paid. Accept pays them; Reject/Withdraw refunds the sender.
+template MockTransferInstruction
+  with
+    admin    : Party
+    transfer : Transfer
+  where
+    signatory admin
+    observer transfer.sender, transfer.receiver
+
+    interface instance TransferInstruction for MockTransferInstruction where
+      view = TransferInstructionView with
+        originalInstructionCid = None
+        transfer
+        status = TransferPendingReceiverAcceptance
+        meta = emptyMetadata
+
+      transferInstruction_acceptImpl _self _arg = do
+        rcid <- create MockHolding with
+          admin
+          owner = transfer.receiver
+          instrumentId = transfer.instrumentId
+          amount = transfer.amount
+          observers = []
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = [toInterfaceContractId @Holding rcid]
+          senderChangeCids = []
+          meta = emptyMetadata
+
+      transferInstruction_rejectImpl _self _arg = refund transfer admin
+      transferInstruction_withdrawImpl _self _arg = refund transfer admin
+      transferInstruction_updateImpl _self _arg =
+        abort "mock registry: update workflow not supported"
+
+-- | MALICIOUS factory #1: claims `Completed` and moves nothing. Exists to
+-- draw the trust boundary precisely. It cannot be reached by a malicious
+-- SPENDER at all (the factory is pinned in the mandate and only the owner
+-- can set it); if the OWNER is tricked into pinning it, the gross-debit
+-- accounting still constrains it: it cannot steal (it lacks the real
+-- registry's authority over real holdings) and whatever damage it does is
+-- bounded by the cap. What it CAN do - fake a `Settled` receipt while
+-- paying nobody - is exactly what Canton package vetting and owner
+-- diligence at pin time must prevent; no mandate code can detect it.
+template LyingFactory
+  with
+    admin     : Party
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+    interface instance TransferFactory for LyingFactory where
+      view = TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_publicFetchImpl _self _arg =
+        pure TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_transferImpl _self _arg =
+        -- Touches nothing, archives nothing, pays nobody. "Trust me."
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = []
+          senderChangeCids = []
+          meta = emptyMetadata
+
+-- | MALICIOUS factory #1b: settles honestly but reports the (real) change
+-- holding TWICE in `senderChangeCids`, which would halve the measured
+-- gross debit if the mandate summed naively - a cap bypass. The mandate's
+-- uniqueness assertion must reject it and roll the settlement back.
+template DupChangeFactory
+  with
+    admin     : Party
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+    interface instance TransferFactory for DupChangeFactory where
+      view = TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_publicFetchImpl _self _arg =
+        pure TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_transferImpl _self arg = do
+        let t = arg.transfer
+        spentInputs <- forA t.inputHoldingCids $ \hCid -> do
+          fetched <- fetchFromInterface @MockHolding hCid
+          case fetched of
+            None -> abort "dup-change factory: input is not a mock holding"
+            Some (cid, h) -> do
+              archive cid
+              pure h
+        let total = sum (map (\h -> h.amount) spentInputs)
+        assertMsg "dup-change factory: insufficient funds" (total > t.amount)
+        rcid <- create MockHolding with
+          admin; owner = t.receiver; instrumentId = t.instrumentId
+          amount = t.amount; observers = []
+        changeCid <- create MockHolding with
+          admin; owner = t.sender; instrumentId = t.instrumentId
+          amount = total - t.amount
+          observers = concatMap (\h -> h.observers) spentInputs
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = [toInterfaceContractId @Holding rcid]
+          -- The lie: one holding, listed twice.
+          senderChangeCids = [toInterfaceContractId @Holding changeCid,
+                              toInterfaceContractId @Holding changeCid]
+          meta = emptyMetadata
+
+-- | An unrelated owner-controlled contract, TEST ONLY. Stands in for
+-- anything else the owner can authorise - another vault, a second mandate,
+-- a governance choice. `Drain` is owner-controlled and consuming.
+template OwnerVault
+  with
+    owner    : Party
+    attacker : Party
+  where
+    signatory owner
+    observer attacker
+    choice Drain : ()
+      controller owner
+      do pure ()  -- a real vault would move funds; the point is that the
+                  -- choice FIRED at all, under owner authority the owner
+                  -- never meant to lend to a transfer factory
+
+-- | MALICIOUS factory #3: once the OWNER is deceived into pinning it, it
+-- abuses the owner authority delegated through the nested mandate
+-- transaction to exercise an UNRELATED owner-controlled contract
+-- (`OwnerVault.Drain`), then reports the transfer as Completed without
+-- moving anything - a tight lie (input == charged amount) that slips past
+-- gross-debit accounting so the drain rides along inside a normal-looking,
+-- in-policy charge.
+--
+-- This is the residual trust boundary made concrete: a malicious-but-vetted
+-- factory wields the owner's delegated authority for MORE than the transfer.
+-- No mandate policy check can bound it - only package vetting can keep such
+-- an implementation off the participant in the first place.
+template AuthorityStealingFactory
+  with
+    admin       : Party
+    observers   : [Party]
+    targetVault : ContractId OwnerVault
+  where
+    signatory admin
+    observer observers
+
+    interface instance TransferFactory for AuthorityStealingFactory where
+      view = TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_publicFetchImpl _self _arg =
+        pure TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_transferImpl _self _arg = do
+        -- The theft: exercise the owner's unrelated contract using the
+        -- owner authority present in this nested body (the choice controller
+        -- is transfer.sender == owner). Then lie that the transfer
+        -- completed - touching no holdings, so with a tight input the
+        -- mandate's gross-debit check is satisfied.
+        exercise targetVault Drain
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = []
+          senderChangeCids = []
+          meta = emptyMetadata
+
+-- | MALICIOUS factory #2: tries to actually consume the real registry's
+-- holdings without paying. This FAILS on authority: archiving a MockHolding
+-- needs its signatory (the real registry admin), which this factory does
+-- NOT have. Note the boundary precisely: Canton authorisation stops it from
+-- touching holdings signed by a DIFFERENT party (the registry), but it does
+-- NOT stop a malicious factory from touching contracts the OWNER can
+-- authorise - see AuthorityStealingFactory for that.
+template SubstitutingFactory
+  with
+    admin     : Party
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+    interface instance TransferFactory for SubstitutingFactory where
+      view = TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_publicFetchImpl _self _arg =
+        pure TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_transferImpl _self arg = do
+        let t = arg.transfer
+        _ <- forA t.inputHoldingCids $ \hCid -> do
+          fetched <- fetchFromInterface @MockHolding hCid
+          case fetched of
+            None -> abort "not a mock holding"
+            Some (cid, _) -> archive cid  -- unauthorised: real admin absent
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = []
+          senderChangeCids = []
+          meta = emptyMetadata
+
+refund : Transfer -> Party -> Update TransferInstructionResult
+refund transfer admin = do
+  scid <- create MockHolding with
+    admin
+    owner = transfer.sender
+    instrumentId = transfer.instrumentId
+    amount = transfer.amount
+    observers = []
+  pure TransferInstructionResult with
+    output = TransferInstructionResult_Failed
+    senderChangeCids = [toInterfaceContractId @Holding scid]
+    meta = emptyMetadata

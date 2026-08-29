@@ -1,0 +1,10 @@
+# Build order: the deployable mandate package, then the test package. Both
+# compile against the OFFICIAL DevNet interface DARs in
+# token-standard/official/ (prebuilt artefacts, nothing to compile).
+#
+# token-standard/splice-api-* hold the upstream interface SOURCE (Splice tag
+# 0.6.8) for reference and offline reading; they are deliberately NOT in the
+# build - building them produces packages whose ids differ from the network.
+packages:
+  - mandate
+  - .
