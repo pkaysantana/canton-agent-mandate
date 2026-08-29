@@ -1,7 +1,9 @@
-# Build order for a fresh clone: the token standard interface packages first,
-# then the starter. `daml build --all` from this directory does it in one go.
+# Build order for a fresh clone: the token standard interface packages, then
+# the deployable mandate package, then the test package.
+# `daml build --all` from this directory does it in one go.
 packages:
   - token-standard/splice-api-token-metadata-v1
   - token-standard/splice-api-token-holding-v1
   - token-standard/splice-api-token-transfer-instruction-v1
+  - mandate
   - .

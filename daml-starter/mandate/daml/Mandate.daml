@@ -16,7 +16,7 @@
 -- mismatch.
 --
 -- Daml cannot do HTTP, so the registry preflight happens off-ledger (see
--- `charge_and_settle` in ../../c8lab.py): the registry supplies a choice
+-- `charge_and_settle` in ../../../c8lab.py): the registry supplies a choice
 -- context and disclosed contracts, and those are passed INTO the choice.
 -- The transfer FACTORY is not caller-supplied: the owner pins it into the
 -- mandate at authorisation time, so a malicious orchestrator cannot swap it.

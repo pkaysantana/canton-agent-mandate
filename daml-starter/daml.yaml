@@ -1,3 +1,6 @@
+# The TEST package: starter examples, mock registry (including the malicious
+# mock factories) and all test scripts. Never deploy this DAR - the
+# deployable contract package is mandate/ (agent-mandate).
 sdk-version: 3.4.10
 name: daml-starter
 source: daml
@@ -10,5 +13,6 @@ data-dependencies:
   - token-standard/splice-api-token-metadata-v1/.daml/dist/splice-api-token-metadata-v1-1.0.0.dar
   - token-standard/splice-api-token-holding-v1/.daml/dist/splice-api-token-holding-v1-1.0.0.dar
   - token-standard/splice-api-token-transfer-instruction-v1/.daml/dist/splice-api-token-transfer-instruction-v1-1.0.0.dar
+  - mandate/.daml/dist/agent-mandate-0.1.0.dar
 build-options:
   - --target=2.1

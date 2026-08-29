@@ -53,8 +53,8 @@ TRANSFER_INSTRUCTION = ("#splice-api-token-transfer-instruction-v1:"
                         "Splice.Api.Token.TransferInstructionV1:TransferInstruction")
 PREAPPROVAL_PROPOSAL = ("#splice-wallet:Splice.Wallet.TransferPreapproval:"
                         "TransferPreapprovalProposal")
-MANDATE          = "#daml-starter:Mandate:Mandate"
-MANDATE_PROPOSAL = "#daml-starter:Mandate:MandateProposal"
+MANDATE          = "#agent-mandate:Mandate:Mandate"
+MANDATE_PROPOSAL = "#agent-mandate:Mandate:MandateProposal"
 
 _tok = {}
 
