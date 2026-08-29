@@ -186,6 +186,48 @@ template LyingFactory
           senderChangeCids = []
           meta = emptyMetadata
 
+-- | MALICIOUS factory #1b: settles honestly but reports the (real) change
+-- holding TWICE in `senderChangeCids`, which would halve the measured
+-- gross debit if the mandate summed naively - a cap bypass. The mandate's
+-- uniqueness assertion must reject it and roll the settlement back.
+template DupChangeFactory
+  with
+    admin     : Party
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+    interface instance TransferFactory for DupChangeFactory where
+      view = TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_publicFetchImpl _self _arg =
+        pure TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_transferImpl _self arg = do
+        let t = arg.transfer
+        spentInputs <- forA t.inputHoldingCids $ \hCid -> do
+          fetched <- fetchFromInterface @MockHolding hCid
+          case fetched of
+            None -> abort "dup-change factory: input is not a mock holding"
+            Some (cid, h) -> do
+              archive cid
+              pure h
+        let total = sum (map (\h -> h.amount) spentInputs)
+        assertMsg "dup-change factory: insufficient funds" (total > t.amount)
+        rcid <- create MockHolding with
+          admin; owner = t.receiver; instrumentId = t.instrumentId
+          amount = t.amount; observers = []
+        changeCid <- create MockHolding with
+          admin; owner = t.sender; instrumentId = t.instrumentId
+          amount = total - t.amount
+          observers = concatMap (\h -> h.observers) spentInputs
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = [toInterfaceContractId @Holding rcid]
+          -- The lie: one holding, listed twice.
+          senderChangeCids = [toInterfaceContractId @Holding changeCid,
+                              toInterfaceContractId @Holding changeCid]
+          meta = emptyMetadata
+
 -- | MALICIOUS factory #2: tries to actually consume the real registry's
 -- holdings without paying (the first step of any substitution/theft). This
 -- FAILS on authority: archiving a MockHolding needs its signatory (the real

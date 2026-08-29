@@ -157,6 +157,19 @@ template Mandate
     -- spent + (inputs - change) <= cap. Registry fees therefore count
     -- against the cap, and a fee that would breach it rolls back the whole
     -- settlement atomically.
+    --
+    -- SCOPE OF THAT CLAIM: "inputs - change = what the owner lost" is NOT a
+    -- universal Token Standard V1 conservation law - the interface does not
+    -- promise it. It is sound for the pinned, vetted Canton Coin/Amulet
+    -- implementation this mandate targets (inputs are archived, change and
+    -- fees come out of them); an arbitrary V1 implementation that violates
+    -- it sits inside the package-vetting trust boundary like every other
+    -- evil-implementation case. Note also that Canton Coin's transfer-level
+    -- fees are currently ZERO under CIP-0078, so on the target happy path
+    -- grossDebit == transfer.amount; the accounting is retained as
+    -- defence-in-depth and for fee-charging implementations. Synchronizer
+    -- TRAFFIC costs are paid by the validator outside the token and are
+    -- deliberately NOT part of this token-denominated cap.
     choice ChargeAndSettle
       : (ContractId Mandate, ContractId ChargeReceipt, TransferInstructionResult)
       with
@@ -176,9 +189,12 @@ template Mandate
           (transfer.instrumentId == instrument)
         -- Gross-debit accounting needs to see what is being spent, so the
         -- registry's automatic holding selection (empty inputs) is not
-        -- allowed here.
+        -- allowed here. Duplicates would double-count an input in
+        -- inputTotal and corrupt the accounting, so they are rejected too.
         assertMsg "explicit input holdings are required"
           (not (null transfer.inputHoldingCids))
+        assertMsg "duplicate input holdings"
+          (unique transfer.inputHoldingCids)
         -- Measure the inputs BEFORE the transfer. The owner is a stakeholder
         -- of their own holdings, so these fetches are authorised by the
         -- owner's authority already present in this body.
@@ -223,6 +239,10 @@ template Mandate
             abort "registry reported the transfer failed"
         -- Measure the change AFTER the transfer: the registry's result names
         -- the owner's change holdings, created in this same transaction.
+        -- A duplicated change cid would double-count change and shrink the
+        -- measured gross debit - a cap bypass - so duplicates are rejected.
+        assertMsg "registry returned duplicate change holdings"
+          (unique result.senderChangeCids)
         changeAmounts <- forA result.senderChangeCids $ \cid -> do
           v <- view <$> fetch cid
           assertMsg "change holding not owned by the mandate owner"

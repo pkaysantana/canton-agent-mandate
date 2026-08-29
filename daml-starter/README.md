@@ -133,11 +133,20 @@ receiver's preapproval.
 What the code states explicitly rather than hides:
 
 - **The cap bounds the owner's gross debit, fees included.** The choice
-  measures the owner's inputs before the transfer and the change after, and
-  requires `spent + (inputs - change) <= cap`. A registry fee that would
-  push the owner's total outflow past the cap rolls back the entire
-  settlement (`testGrossDebitFees`). Receipts record `amount`, `fee` and
-  `grossDebit` separately.
+  measures the owner's inputs before the transfer and the change after
+  (both lists checked for duplicates), and requires
+  `spent + (inputs - change) <= cap`. A registry fee that would push the
+  owner's total outflow past the cap rolls back the entire settlement
+  (`testGrossDebitFees`). Receipts record `amount`, `fee` and `grossDebit`
+  separately. Scope: `inputs - change = owner's loss` is NOT a universal
+  Token Standard V1 conservation guarantee - it is sound for the pinned,
+  vetted Canton Coin/Amulet implementation we target, and arbitrary V1
+  implementations remain inside the package-vetting trust boundary. Canton
+  Coin's transfer-level fees are currently zero under CIP-0078, so on the
+  target happy path `grossDebit == transfer.amount`; the accounting is
+  retained as defence-in-depth and for fee-charging implementations.
+  Synchronizer traffic costs are paid by the validator outside the token
+  and are deliberately not part of this token-denominated cap.
 - **Completed is trusted, not re-fetched.** The mandate does not fetch the
   receiver's new holdings to double-check them: a fetch must be authorised
   by a stakeholder of the fetched contract, and those fresh holdings have

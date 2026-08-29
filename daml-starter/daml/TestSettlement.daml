@@ -293,6 +293,10 @@ testSettleAdversarial = script do
   submitMustFail agent do charge (mkTransfer inst alice bob (-10.0) [holdingCid] now)
   -- No inputs: gross-debit accounting requires explicit holdings.
   submitMustFail agent do charge (mkTransfer inst alice bob 10.0 [] now)
+  -- Duplicate inputs: the same holding listed twice would double-count in
+  -- the gross-debit measurement, so it is rejected before anything runs.
+  submitMustFail agent do
+    charge (mkTransfer inst alice bob 10.0 [holdingCid, holdingCid] now)
   -- Substitute the sender: the funding party is the mandate owner, full stop.
   -- Even with the agent's own funds this must not pass through the mandate.
   agentHolding <- submit registry do
@@ -451,6 +455,36 @@ testMaliciousFactoryBoundary = script do
       extraArgs = emptyExtra
   Some _ <- queryContractId alice h50    -- untouched
   pure ()
+
+-- | A registry result that lists the same change holding twice would halve
+-- the measured gross debit - a cap bypass through the accounting. The
+-- mandate's uniqueness assertion rejects it AFTER the transfer ran, which
+-- rolls the entire settlement back: balances untouched, nothing spent,
+-- no receipt.
+testDuplicateChangeRejected : Script ()
+testDuplicateChangeRejected = script do
+  s@Setup{..} <- mkSetup
+  now <- getTime
+  dup <- submit registry do
+    createCmd DupChangeFactory with
+      admin = registry; observers = [alice, agent]
+  m2 <- submit alice do
+    exerciseCmd mandateCid SetFactory with
+      newFactory = toInterfaceContractId dup
+  submitMustFail agent do
+    exerciseCmd m2 ChargeAndSettle with
+      transfer = mkTransfer inst alice bob 10.0 [holdingCid] now
+      extraArgs = emptyExtra
+  -- Rollback was total: the transfer inside the failed transaction never
+  -- happened.
+  aliceHoldings <- query @MockHolding alice
+  assert (sum (map (\(_, h) -> h.amount) aliceHoldings) == 1000.0)
+  bobHoldings <- query @MockHolding bob
+  assert (null bobHoldings)
+  Some m <- queryContractId alice m2
+  assert (m.spent == 0.0 && m.charges == 0)
+  receipts <- query @ChargeReceipt alice
+  assert (null receipts)
 
 -- | Revocation kills settlement instantly; the agent cannot block it.
 testSettleAfterRevocation : Script ()
