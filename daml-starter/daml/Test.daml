@@ -143,10 +143,11 @@ testAuthorisation = script do
   merchant <- allocateParty "Merchant"
   outsider <- allocateParty "Outsider"
   bob      <- allocateParty "Bob"
+  carol    <- allocateParty "Carol"
   now      <- getTime
   let deadline = addRelTime now (hours 24)
 
-  prop <- makeProposal alice merchant [bob] 100.0 deadline
+  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline
   m <- submit merchant do exerciseCmd prop Accept
   -- Charge is the spender's permission, not the owner's or a bystander's.
   submitMustFail alice do
@@ -160,8 +161,16 @@ testAuthorisation = script do
     exerciseCmd m Adjust with newCap = 200.0
   submitMustFail merchant do
     exerciseCmd m2 Reauthorise with newAllowed = [bob, outsider]
-  _ <- submit (actAs [alice, merchant]) do
+  m3 <- submit (actAs [alice, merchant]) do
     exerciseCmd m2 Reauthorise with newAllowed = [bob, outsider]
+  (m4, _) <- submit merchant do
+    exerciseCmd m3 Charge with recipient = outsider; amount = 1.0
+  submitMustFail merchant do
+    exerciseCmd m4 Charge with recipient = carol; amount = 1.0
+
+  rejected <- makeProposal alice merchant [bob] 100.0 deadline
+  submit merchant do exerciseCmd rejected Reject
+  submitMustFail merchant do exerciseCmd rejected Accept
 
   -- Both signatories are required to create these contracts directly.
   submitMustFail alice do
@@ -256,6 +265,9 @@ testAuditTrail = script do
   assert (adjusted.cap == 200.0 && adjusted.spent == 30.0)
   Some historical <- queryContractId alice r1Cid
   assert (historical.capAtCharge == 100.0)
+  -- An audit record neither party can unilaterally delete is the point.
+  submitMustFail merchant do exerciseCmd r1Cid Archive
+  submitMustFail alice do exerciseCmd r1Cid Archive
 
 testMalformedMandates : Script ()
 testMalformedMandates = script do

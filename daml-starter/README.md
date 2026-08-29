@@ -3,7 +3,7 @@
 Working code to copy from. Everything here builds and every test passes.
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export JAVA_HOME=/opt/homebrew/opt/openjdk@21
 export PATH="$HOME/.daml/bin:$JAVA_HOME/bin:$PATH"
 
 daml build
@@ -16,8 +16,8 @@ daml/Test.daml:testAllowList: ok, 1 active contracts, 7 transactions.
 daml/Test.daml:testExpiry: ok, 2 active contracts, 7 transactions.
 daml/Test.daml:testRevocation: ok, 0 active contracts, 8 transactions.
 daml/Test.daml:testCapEnforcement: ok, 6 active contracts, 12 transactions.
-daml/Test.daml:testAuditTrail: ok, 4 active contracts, 6 transactions.
-daml/Test.daml:testAuthorisation: ok, 1 active contracts, 11 transactions.
+daml/Test.daml:testAuditTrail: ok, 4 active contracts, 8 transactions.
+daml/Test.daml:testAuthorisation: ok, 2 active contracts, 16 transactions.
 daml/Test.daml:testMandateHappyPath: ok, 3 active contracts, 4 transactions.
 daml/Test.daml:testIou: ok, 1 active contracts, 4 transactions.
 ```
