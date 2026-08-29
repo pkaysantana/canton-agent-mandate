@@ -40,7 +40,7 @@ Six steps. This is the shape of every Canton app.
 
 ```bash
 python3 c8lab.py                          # check everything, list parties, balances
-python3 c8lab.py party myteam             # step 2
+python3 c8lab.py party myteam             # step 2 (then grant rights explicitly)
 python3 c8lab.py preapproval <party>      # step 3
 python3 c8lab.py holdings <party>         # steps 4 and 5
 python3 c8lab.py transfer <from> <to> 25  # step 6
@@ -134,8 +134,10 @@ Import it, do not just use the CLI.
 | `call(path, body, sub)` | Any Ledger API call. Prints the real error on failure. |
 | `ledger_end()` | Current offset |
 | `parties()` / `local_parties()` | What the node knows, and what it hosts |
-| `allocate_party(hint)` | Allocate, or reuse if it exists |
-| `grant_act_as(user, party)` | Fix a 403 |
+| `allocate_party(hint)` | Allocate, or reuse if it exists. Grants NOTHING: rights are explicit |
+| `grant_act_as(user, party)` | Fix a 403 (CanActAs) |
+| `grant_read_as(user, party)` | CanReadAs: see contracts, cannot submit |
+| `user_rights(user)` / `check_agent_user(user, spender, owner)` | Inspect rights; assert the agent credential is least-privileged (CanActAs spender + CanReadAs owner, NOT CanActAs owner) |
 | `holdings(party)` | Balances, via the interface filter |
 | `submit(cmds, act_as, disclosed)` | Any command, with disclosed contracts |
 | `create_preapproval(me, provider)` | Step 3 |
