@@ -53,6 +53,8 @@ TRANSFER_INSTRUCTION = ("#splice-api-token-transfer-instruction-v1:"
                         "Splice.Api.Token.TransferInstructionV1:TransferInstruction")
 PREAPPROVAL_PROPOSAL = ("#splice-wallet:Splice.Wallet.TransferPreapproval:"
                         "TransferPreapprovalProposal")
+MANDATE          = "#daml-starter:Mandate:Mandate"
+MANDATE_PROPOSAL = "#daml-starter:Mandate:MandateProposal"
 
 _tok = {}
 
@@ -207,11 +209,13 @@ def holdings(party, sub=USER):
 
 
 def submit(commands, act_as, sub=USER, disclosed=None, command_id=None,
-           want_transaction=False):
+           want_transaction=False, read_as=None):
     body = {"commands": commands,
             "commandId": command_id or f"c8lab-{uuid.uuid4()}",
             "actAs": act_as if isinstance(act_as, list) else [act_as],
             "userId": sub}
+    if read_as:
+        body["readAs"] = read_as if isinstance(read_as, list) else [read_as]
     if disclosed:
         body["disclosedContracts"] = [
             {"templateId": c["templateId"], "contractId": c["contractId"],
@@ -333,6 +337,118 @@ def accept_transfer(instruction_cid, receiver, sub=USER):
                  disclosed=ctx.get("disclosedContracts", []))
 
 
+def _iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def mandate_propose(owner, spender, allowed, cap, hours=24,
+                    instrument="Amulet", sub=USER):
+    """D1 step 1: the owner proposes a spend mandate to the agent.
+
+    The cap is denominated in `instrument`; the mandate pins the instrument
+    so the agent cannot settle a different token of the owner's under it.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    return submit([{"CreateCommand": {
+        "templateId": MANDATE_PROPOSAL,
+        "createArguments": {
+            "owner": owner, "spender": spender, "allowed": allowed,
+            "cap": str(cap),
+            "expiresAt": _iso(now + datetime.timedelta(hours=hours)),
+            "instrument": {"admin": admin_party(), "id": instrument}}}}],
+        act_as=owner, sub=sub, want_transaction=True)
+
+
+def mandate_accept(proposal_cid, spender, sub=USER):
+    """D1 step 2: the agent accepts, creating the Mandate."""
+    return submit([{"ExerciseCommand": {
+        "templateId": MANDATE_PROPOSAL, "contractId": proposal_cid,
+        "choice": "Accept", "choiceArgument": {}}}],
+        act_as=spender, sub=sub, want_transaction=True)
+
+
+def charge_and_settle(mandate_cid, owner, spender, receiver, amount,
+                      instrument="Amulet", sub=USER, hours=24):
+    """D1 settlement: ONE Canton transaction in which the Mandate validates
+    the exact Token Standard transfer it then executes.
+
+    Everything up to `submit` is off-ledger preparation, because Daml cannot
+    do HTTP:
+      1. read the OWNER's spendable holdings from the ACS,
+      2. ask the registry for a transfer factory + choice context; privacy
+         means the issuer's config contracts arrive as disclosed contracts.
+    Then one submission, signed by the SPENDER alone: exercise
+    Mandate.ChargeAndSettle, which checks cap/expiry/allow-list/instrument
+    against the `transfer` record and nested-exercises
+    TransferFactory_Transfer on that same record. The registry cannot be
+    lied to about what was authorised, because there is only one object.
+
+    Returns transferKind ('direct': money moved; 'offer': a pending
+    TransferInstruction the receiver must accept - money has NOT moved yet),
+    plus the receipt and successor mandate contract ids.
+    """
+    if not REGISTRY:
+        raise LabError("settlement needs C8_REGISTRY. See README.md.")
+    amt = float(amount)
+    if amt <= 0:
+        raise LabError("amount must be greater than zero")
+
+    admin = admin_party()
+    spendable = [h for h in holdings(owner, sub=sub)
+                 if not h["locked"] and h["instrument"] == instrument
+                 and h["admin"] == admin]
+    total = sum(float(h["amount"]) for h in spendable)
+    if total < amt:
+        raise LabError(f"owner has {total} spendable {instrument}, needs {amt}")
+
+    t0 = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    transfer = {"sender": owner, "receiver": receiver, "amount": str(amount),
+                "instrumentId": {"admin": admin, "id": instrument},
+                "requestedAt": _iso(t0),
+                "executeBefore": _iso(t0 + datetime.timedelta(hours=hours)),
+                "inputHoldingCids": [h["contractId"] for h in spendable],
+                "meta": {"values": {}}}
+
+    # HTTP ends here: the registry hands back the factory id, the choice
+    # context and the disclosed contracts for this one transaction.
+    fac = registry("/registry/transfer-instruction/v1/transfer-factory",
+                   {"choiceArguments": {
+                       "expectedAdmin": admin, "transfer": transfer,
+                       "extraArgs": {"context": {"values": {}},
+                                     "meta": {"values": {}}}}})
+    cc = fac.get("choiceContext", {})
+
+    # Daml begins here: one command, one transaction, policy and settlement
+    # contractually linked inside Mandate.ChargeAndSettle.
+    res = submit([{"ExerciseCommand": {
+                    "templateId": MANDATE,
+                    "contractId": mandate_cid,
+                    "choice": "ChargeAndSettle",
+                    "choiceArgument": {
+                        "factoryCid": fac["factoryId"],
+                        "transfer": transfer,
+                        "extraArgs": {
+                            "context": cc.get("choiceContextData", {}),
+                            "meta": {"values": {}}}}}}],
+                 act_as=spender, read_as=owner, sub=sub,
+                 disclosed=cc.get("disclosedContracts", []),
+                 want_transaction=True)
+    out = {"transferKind": fac.get("transferKind"),
+           "receiptCid": _find_created(res, "Mandate:ChargeReceipt"),
+           "mandateCid": _find_created(res, "Mandate:Mandate"),
+           "instructionCid": _find_instruction_cid(res),
+           "result": res}
+    return out
+
+
+def _find_created(res, template_suffix):
+    for ev in res.get("transaction", {}).get("events", []):
+        created = ev.get("CreatedTreeEvent", {}).get("value") or ev.get("CreatedEvent")
+        if created and template_suffix in str(created.get("templateId", "")):
+            return created.get("contractId")
+    return None
+
+
 def check():
     """Run this first when something is broken."""
     print(f"base       {BASE}")
@@ -382,6 +498,18 @@ def main():
     p.add_argument("sender"); p.add_argument("receiver"); p.add_argument("amount")
     p.add_argument("--instrument", default="Amulet")
     p = sub.add_parser("accept");      p.add_argument("instruction_cid"); p.add_argument("receiver")
+    p = sub.add_parser("mandate-propose")
+    p.add_argument("owner"); p.add_argument("spender")
+    p.add_argument("allowed", help="comma-separated party hints")
+    p.add_argument("cap")
+    p.add_argument("--hours", type=int, default=24)
+    p.add_argument("--instrument", default="Amulet")
+    p = sub.add_parser("mandate-accept")
+    p.add_argument("proposal_cid"); p.add_argument("spender")
+    p = sub.add_parser("mandate-settle")
+    p.add_argument("mandate_cid"); p.add_argument("owner"); p.add_argument("spender")
+    p.add_argument("receiver"); p.add_argument("amount")
+    p.add_argument("--instrument", default="Amulet")
     a = ap.parse_args()
 
     try:
@@ -410,6 +538,28 @@ def main():
         elif a.cmd == "accept":
             print(json.dumps(accept_transfer(a.instruction_cid,
                                              find_party(a.receiver)), indent=2))
+        elif a.cmd == "mandate-propose":
+            res = mandate_propose(find_party(a.owner), find_party(a.spender),
+                                  [find_party(x) for x in a.allowed.split(",")],
+                                  a.cap, hours=a.hours, instrument=a.instrument)
+            cid = _find_created(res, "Mandate:MandateProposal")
+            print(f"proposal {cid}")
+            print(f"\nThe SPENDER accepts it with:\n  python3 c8lab.py "
+                  f"mandate-accept {cid} {a.spender}")
+        elif a.cmd == "mandate-accept":
+            res = mandate_accept(a.proposal_cid, find_party(a.spender))
+            print(f"mandate {_find_created(res, 'Mandate:Mandate')}")
+        elif a.cmd == "mandate-settle":
+            out = charge_and_settle(a.mandate_cid, find_party(a.owner),
+                                    find_party(a.spender), find_party(a.receiver),
+                                    a.amount, instrument=a.instrument)
+            print(f"transferKind {out['transferKind']}")
+            print(f"receipt      {out['receiptCid']}")
+            print(f"mandate      {out['mandateCid']}")
+            if out["transferKind"] == "offer":
+                print(f"\nThe transfer is PENDING, the receiver has not been "
+                      f"paid yet.\nAccept it with:\n  python3 c8lab.py accept "
+                      f"{out['instructionCid']} {a.receiver}")
     except LabError as e:
         print(f"\nERROR: {e}", file=sys.stderr)
         sys.exit(1)

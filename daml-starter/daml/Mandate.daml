@@ -8,15 +8,45 @@
 -- in Python is a suggestion; a cap in a choice body is a rule the network
 -- enforces, including against a spender who talks to the Ledger API directly.
 --
--- SETTLEMENT IS OUT OF SCOPE ON THIS BRANCH. `Charge` authorises spending and
--- writes an on-ledger receipt; it does not move Canton Coin. Real Token
--- Standard settlement (exercising TransferFactory_Transfer with the registry's
--- disclosed contracts, see ../../README.md) will be integrated separately once
--- the DevNet architecture is confirmed with Cantor8. Nothing here pretends
--- value has moved: a ChargeReceipt records an *authorisation*, not a payment.
+-- SETTLEMENT: `ChargeAndSettle` moves real Token Standard value. The policy
+-- check and the transfer are the SAME Daml transaction, and they share the
+-- SAME `Transfer` record: the mandate validates the fields of the exact
+-- object it then nested-exercises on the registry's `TransferFactory`. There
+-- is no second amount or recipient anywhere for a malicious caller to
+-- mismatch.
+--
+-- Daml cannot do HTTP, so the registry preflight happens off-ledger (see
+-- `charge_and_settle` in ../../c8lab.py): the registry supplies the factory
+-- contract id, a choice context and disclosed contracts, and those are passed
+-- INTO this choice. Where HTTP ends, this file begins.
+--
+-- The old `Charge` choice is kept as the settlement-free variant: it
+-- authorises and receipts, but moves nothing. Receipts now say explicitly
+-- which of the three things happened: authorised only, settled, or pending a
+-- `TransferInstruction` the receiver still has to accept.
 module Mandate where
 
 import DA.List (unique)
+
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.TransferInstructionV1
+
+
+-- | What actually happened to the money behind a receipt. An authorisation is
+-- not a payment, and a pending instruction is not a completed one; an audit
+-- trail that conflates them is lying.
+data SettlementStatus
+  = AuthorisedOnly
+      -- ^ `Charge`: policy consumed, no value moved on the ledger.
+  | Settled
+      -- ^ `ChargeAndSettle`, direct path: the registry completed the transfer
+      -- in this transaction and the receiver holds the funds.
+  | PendingInstruction with instructionCid : ContractId TransferInstruction
+      -- ^ `ChargeAndSettle`, offer path: the sender's funds are committed and
+      -- a `TransferInstruction` awaits the receiver's acceptance. Money has
+      -- NOT reached the receiver yet.
+  deriving (Show, Eq)
 
 
 -- | A mandate is the policy. It is created by Accept on a proposal, and every
@@ -24,14 +54,17 @@ import DA.List (unique)
 -- remaining allowance is always the ledger's own state, never a cached number.
 template Mandate
   with
-    owner     : Party        -- who is paying
-    spender   : Party        -- the agent, or merchant
-    allowed   : [Party]      -- the only counterparties the spender may pay
-    cap       : Decimal      -- total they may spend over the mandate's life
-    spent     : Decimal      -- how much so far
-    expiresAt : Time
-    mandateId : Text         -- stable across the archive/recreate chain
-    charges   : Int          -- how many charges have been authorised
+    owner      : Party        -- who is paying
+    spender    : Party        -- the agent, or merchant
+    allowed    : [Party]      -- the only counterparties the spender may pay
+    cap        : Decimal      -- total they may spend over the mandate's life
+    spent      : Decimal      -- how much so far
+    expiresAt  : Time
+    instrument : InstrumentId -- the token the cap is denominated in. Pinned
+                              -- here so a spender cannot settle a different
+                              -- instrument of the owner's under this cap.
+    mandateId  : Text         -- stable across the archive/recreate chain
+    charges    : Int          -- how many charges have been authorised
   where
     -- Checked on every create, so no future choice can break these.
     ensure cap > 0.0
@@ -53,6 +86,7 @@ template Mandate
 
     -- | Authorise spending within the policy. No owner signature: that is the
     -- whole point of a mandate. Returns the successor mandate and the receipt.
+    -- This variant moves NO value; its receipt says `AuthorisedOnly`.
     choice Charge : (ContractId Mandate, ContractId ChargeReceipt)
       with
         recipient : Party
@@ -75,7 +109,71 @@ template Mandate
               capAtCharge = cap
               spentAfter
               expiresAtAtCharge = expiresAt
+              instrument
+              settlement = AuthorisedOnly
         pure (m, r)
+
+    -- | Authorise AND settle in one transaction. The spender submits this
+    -- alone; the owner's authority to move the funds comes from the mandate
+    -- itself (the owner is a signatory, so it is available inside this body
+    -- for the nested `TransferFactory_Transfer`, whose controller is
+    -- `transfer.sender`).
+    --
+    -- Every policy check below reads a field of the exact `transfer` record
+    -- that is exercised afterwards. That is the security argument: there is
+    -- one object, checked and then settled, so "authorised amount" and
+    -- "settled amount" cannot differ.
+    --
+    -- The factory contract id, choice context and disclosed contracts come
+    -- from the registry's off-ledger preflight and ride in as arguments.
+    choice ChargeAndSettle
+      : (ContractId Mandate, ContractId ChargeReceipt, TransferInstructionResult)
+      with
+        factoryCid : ContractId TransferFactory
+        transfer   : Transfer
+        extraArgs  : ExtraArgs
+      controller spender
+      do
+        now <- getTime
+        assertMsg "mandate expired" (now < expiresAt)
+        assertMsg "transfer sender must be the mandate owner"
+          (transfer.sender == owner)
+        assertMsg "amount must be positive" (transfer.amount > 0.0)
+        assertMsg "charge would exceed the cap" (spent + transfer.amount <= cap)
+        assertMsg "recipient is not on the allow-list"
+          (transfer.receiver `elem` allowed)
+        assertMsg "wrong instrument for this mandate"
+          (transfer.instrumentId == instrument)
+        -- The same record we just validated, handed straight to the registry.
+        -- `expectedAdmin` is pinned from the mandate's own instrument, not
+        -- taken from the caller.
+        result <- exercise factoryCid TransferFactory_Transfer with
+          expectedAdmin = instrument.admin
+          transfer
+          extraArgs
+        settlement <- case result.output of
+          TransferInstructionResult_Completed {} -> pure Settled
+          TransferInstructionResult_Pending { transferInstructionCid } ->
+            pure (PendingInstruction transferInstructionCid)
+          TransferInstructionResult_Failed ->
+            -- Refuse to receipt a failure. Aborting rolls back the whole
+            -- transaction, so no allowance is consumed either.
+            abort "registry reported the transfer failed"
+        let spentAfter = spent + transfer.amount
+        m <- create this with spent = spentAfter; charges = charges + 1
+        r <- create ChargeReceipt with
+              owner; spender
+              recipient = transfer.receiver
+              amount = transfer.amount
+              chargedAt = now
+              mandateId
+              sequence = charges + 1
+              capAtCharge = cap
+              spentAfter
+              expiresAtAtCharge = expiresAt
+              instrument
+              settlement
+        pure (m, r, result)
 
     -- | Change the cap. Both parties are signatories, so the spender cannot
     -- raise its own cap and the owner cannot raise the spender's obligation
@@ -111,6 +209,11 @@ template Mandate
 -- archive/recreate chain) and the limits actually in force at that moment are
 -- copied in, so a later Adjust cannot rewrite history.
 --
+-- `settlement` says what happened to the money, honestly: `AuthorisedOnly`
+-- moved nothing, `PendingInstruction` committed funds the receiver has not
+-- accepted yet, and only `Settled` means the receiver was paid in this
+-- transaction.
+--
 -- It has no choices: an audit record that can be edited is not one. Archiving
 -- still needs both signatories, so neither party can quietly delete evidence.
 template ChargeReceipt
@@ -125,6 +228,8 @@ template ChargeReceipt
     capAtCharge       : Decimal
     spentAfter        : Decimal  -- cumulative spend including this charge
     expiresAtAtCharge : Time
+    instrument        : InstrumentId      -- what the amounts are denominated in
+    settlement        : SettlementStatus  -- what actually happened to the money
   where
     ensure amount > 0.0 && sequence > 0 && spentAfter <= capAtCharge
     signatory owner, spender
@@ -135,11 +240,12 @@ template ChargeReceipt
 -- it, and the two are rarely online together.
 template MandateProposal
   with
-    owner     : Party
-    spender   : Party
-    allowed   : [Party]
-    cap       : Decimal
-    expiresAt : Time
+    owner      : Party
+    spender    : Party
+    allowed    : [Party]
+    cap        : Decimal
+    expiresAt  : Time
+    instrument : InstrumentId
   where
     signatory owner
     observer spender
@@ -151,7 +257,7 @@ template MandateProposal
         -- unique on the ledger and survives every Charge, which archives the
         -- mandate and creates its successor.
         create Mandate with
-          owner; spender; allowed; cap; expiresAt
+          owner; spender; allowed; cap; expiresAt; instrument
           spent = 0.0
           mandateId = show self
           charges = 0

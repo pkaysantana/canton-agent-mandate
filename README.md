@@ -142,6 +142,8 @@ Import it, do not just use the CLI.
 | `registry(path, body)` | Call the token registry |
 | `transfer(from, to, amount)` | Step 6, both phases |
 | `check()` | Run this first when something is broken |
+| `mandate_propose(...)` / `mandate_accept(...)` | D1: set up a spend mandate |
+| `charge_and_settle(mandate, owner, spender, to, amt)` | D1: registry preflight, then ONE transaction where the Mandate validates and settles the same Token Standard transfer |
 
 Only reuse parties where `isLocal` is true. A node lists parties it has heard
 about from the network, including ones hosted elsewhere that it cannot submit

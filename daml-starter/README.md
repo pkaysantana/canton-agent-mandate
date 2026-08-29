@@ -20,10 +20,21 @@ daml/Test.daml:testAuditTrail: ok, 4 active contracts, 8 transactions.
 daml/Test.daml:testAuthorisation: ok, 2 active contracts, 16 transactions.
 daml/Test.daml:testMandateHappyPath: ok, 3 active contracts, 4 transactions.
 daml/Test.daml:testIou: ok, 1 active contracts, 4 transactions.
+daml/TestSettlement.daml:testNestedAuthority: ok, 7 active contracts, 9 transactions.
+daml/TestSettlement.daml:testSettleDirect: ok, 7 active contracts, 6 transactions.
+daml/TestSettlement.daml:testSettlePending: ok, 5 active contracts, 6 transactions.
+daml/TestSettlement.daml:testSettleAdversarial: ok, 9 active contracts, 20 transactions.
+daml/TestSettlement.daml:testSettleAfterRevocation: ok, 2 active contracts, 6 transactions.
+daml/TestSettlement.daml:testSettleAfterExpiry: ok, 5 active contracts, 10 transactions.
 ```
 
 `daml test` runs in memory in about a second. No node, no Docker, no network.
 That is your development loop.
+
+The `token-standard/` directory vendors the three official Token Standard
+interface packages (`splice-api-token-*-v1`, Apache-2.0, from the Splice repo
+at tag 0.6.8). `multi-package.yaml` makes `daml build` compile them first, so
+a fresh clone builds with the one command above.
 
 ## What is here
 
@@ -46,7 +57,9 @@ time, and only to explicitly named counterparties.
 MandateProposal          owner offers
    -> Accept             spender takes it up, creating a Mandate
 Mandate
-   -> Charge             spender spends to an allowed party, within the cap
+   -> Charge             authorise only: receipt, no value moved
+   -> ChargeAndSettle    authorise AND move real Token Standard value,
+                         in one transaction
    -> Adjust             change the cap. Needs BOTH signatures
    -> Reauthorise        change the allow-list. Needs BOTH signatures
    -> Revoke             owner stops it. Spender cannot block this
@@ -58,6 +71,42 @@ the next state with updated `spent` and `charges`. The returned
 sequence number, mandate identity, deadline, cap at charge time, and cumulative
 spend. Receipts are signed by the owner and spender and visible to the
 recipient as well as the mandate parties.
+
+## Settlement
+
+`ChargeAndSettle` is the point of this branch. The spender submits one
+transaction containing one command; inside it, the mandate:
+
+1. checks expiry, cap, allow-list and instrument against the fields of the
+   `transfer : Transfer` argument, the actual Token Standard object;
+2. nested-exercises `TransferFactory_Transfer` on the registry's factory
+   with **that same object**.
+
+There is no separate policy amount or recipient anywhere, so "what was
+authorised" and "what was settled" cannot differ; there is one record, and
+the whole thing commits or rolls back atomically.
+
+The authority model that makes it work: `TransferFactory_Transfer` is
+controlled by `transfer.sender`, which the mandate requires to be the owner.
+The spender alone cannot exercise the factory (`testNestedAuthority` proves
+it fails), but inside a Mandate choice the authority context is the mandate's
+signatories, owner included. The mandate contract IS the owner's standing
+authorisation.
+
+Daml cannot do HTTP, so the registry preflight (factory id, choice context,
+disclosed contracts) happens off-ledger before submission; see
+`charge_and_settle` in `../c8lab.py`.
+
+Receipts carry a `settlement` field that tells the truth about the money:
+
+- `AuthorisedOnly`: `Charge`, nothing moved.
+- `Settled`: direct path, the receiver holds the funds.
+- `PendingInstruction cid`: offer path, a `TransferInstruction` is waiting
+  for the receiver to accept. The funds are committed but have NOT arrived.
+
+`TestToken.daml` is a mock registry implementing the real
+`splice-api-token-*-v1` interfaces so `daml test` can prove all of this
+in memory; the mandate code does not know it is talking to a mock.
 
 The allow-list is part of the policy, not a UI convention. It must be non-empty
 and unique, and it excludes both the owner and spender. Every charge checks
@@ -75,17 +124,12 @@ enforces.
 
 ## Where to take it
 
-This branch records charge authorisations but does not move any money. Real
-Token Standard settlement is intentionally out of scope here and will be
-integrated separately once the DevNet architecture is confirmed with Cantor8.
-Nothing in `ChargeReceipt` pretends that value has moved.
-
-- **Move real value.** Make `Charge` exercise a token standard transfer instead
-  of only recording an authorisation. See `../README.md` for how transfers work
-  and `c8lab.py` for a working one; integrate it only after the DevNet
-  architecture is confirmed with Cantor8.
 - **Per-period caps.** "100 per month" rather than 100 in total. Harder than it
-  looks because of date arithmetic. Get the total cap working first.
+  looks because of date arithmetic. The total cap works; build on it.
+- **Allowance release on rejection.** A `PendingInstruction` consumes
+  allowance when it is created. If the receiver rejects or the sender
+  withdraws, the funds come back but the allowance does not. Deliberate
+  (conservative), but a refund choice would be a real improvement.
 
 ## Three things that catch people
 

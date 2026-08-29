@@ -7,6 +7,7 @@ import DA.Time (addRelTime, hours, minutes, time)
 import Daml.Script
 import Iou
 import Mandate
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
 
 testIou : Script ()
 testIou = script do
@@ -28,10 +29,16 @@ testIou = script do
   submitMustFail bob do exerciseCmd iou2 Split with splitAmount = 150.0
   pure ()
 
-makeProposal : Party -> Party -> [Party] -> Decimal -> Time -> Script (ContractId MandateProposal)
-makeProposal owner spender allowed cap expiresAt = submit owner do
+-- The policy tests below do not settle anything, but every mandate still
+-- names the instrument its cap is denominated in, so each test allocates a
+-- Registry party to act as the instrument admin.
+cc : Party -> InstrumentId
+cc registry = InstrumentId with admin = registry; id = "CC"
+
+makeProposal : Party -> Party -> [Party] -> Decimal -> Time -> InstrumentId -> Script (ContractId MandateProposal)
+makeProposal owner spender allowed cap expiresAt instrument = submit owner do
   createCmd MandateProposal with
-    owner; spender; allowed; cap; expiresAt
+    owner; spender; allowed; cap; expiresAt; instrument
 
 testMandateHappyPath : Script ()
 testMandateHappyPath = script do
@@ -39,10 +46,11 @@ testMandateHappyPath = script do
   merchant <- allocateParty "Merchant"
   bob      <- allocateParty "Bob"
   carol    <- allocateParty "Carol"
+  registry <- allocateParty "Registry"
   now      <- getTime
   let deadline = addRelTime now (hours 24)
 
-  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline
+  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline (cc registry)
   m <- submit merchant do exerciseCmd prop Accept
 
   (m2, r1) <- submit merchant do
@@ -66,10 +74,11 @@ testCapEnforcement = script do
   alice    <- allocateParty "Alice"
   merchant <- allocateParty "Merchant"
   bob      <- allocateParty "Bob"
+  registry <- allocateParty "Registry"
   now      <- getTime
   let deadline = addRelTime now (hours 24)
 
-  prop <- makeProposal alice merchant [bob] 100.0 deadline
+  prop <- makeProposal alice merchant [bob] 100.0 deadline (cc registry)
   m <- submit merchant do exerciseCmd prop Accept
   (m2, _) <- submit merchant do
     exerciseCmd m Charge with recipient = bob; amount = 35.0
@@ -79,13 +88,13 @@ testCapEnforcement = script do
   submitMustFail merchant do
     exerciseCmd m3 Charge with recipient = bob; amount = 0.01
 
-  prop2 <- makeProposal alice merchant [bob] 100.0 deadline
+  prop2 <- makeProposal alice merchant [bob] 100.0 deadline (cc registry)
   m4 <- submit merchant do exerciseCmd prop2 Accept
   -- A charge larger than the total cap must be rejected.
   submitMustFail merchant do
     exerciseCmd m4 Charge with recipient = bob; amount = 100.01
 
-  prop3 <- makeProposal alice merchant [bob] 100.0 deadline
+  prop3 <- makeProposal alice merchant [bob] 100.0 deadline (cc registry)
   m5 <- submit merchant do exerciseCmd prop3 Accept
   (m6, _) <- submit merchant do
     exerciseCmd m5 Charge with recipient = bob; amount = 60.0
@@ -100,10 +109,11 @@ testAllowList = script do
   bob      <- allocateParty "Bob"
   carol    <- allocateParty "Carol"
   outsider <- allocateParty "Outsider"
+  registry <- allocateParty "Registry"
   now      <- getTime
   let deadline = addRelTime now (hours 24)
 
-  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline
+  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline (cc registry)
   m <- submit merchant do exerciseCmd prop Accept
   submitMustFail merchant do
     exerciseCmd m Charge with recipient = outsider; amount = 1.0
@@ -124,10 +134,11 @@ testExpiry = script do
   alice    <- allocateParty "Alice"
   merchant <- allocateParty "Merchant"
   bob      <- allocateParty "Bob"
+  registry <- allocateParty "Registry"
   now      <- getTime
   let deadline = addRelTime now (hours 1)
 
-  prop <- makeProposal alice merchant [bob] 100.0 deadline
+  prop <- makeProposal alice merchant [bob] 100.0 deadline (cc registry)
   m <- submit merchant do exerciseCmd prop Accept
   passTime (minutes 59)
   (m2, _) <- submit merchant do
@@ -144,10 +155,11 @@ testAuthorisation = script do
   outsider <- allocateParty "Outsider"
   bob      <- allocateParty "Bob"
   carol    <- allocateParty "Carol"
+  registry <- allocateParty "Registry"
   now      <- getTime
   let deadline = addRelTime now (hours 24)
 
-  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline
+  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline (cc registry)
   m <- submit merchant do exerciseCmd prop Accept
   -- Charge is the spender's permission, not the owner's or a bystander's.
   submitMustFail alice do
@@ -168,7 +180,7 @@ testAuthorisation = script do
   submitMustFail merchant do
     exerciseCmd m4 Charge with recipient = carol; amount = 1.0
 
-  rejected <- makeProposal alice merchant [bob] 100.0 deadline
+  rejected <- makeProposal alice merchant [bob] 100.0 deadline (cc registry)
   submit merchant do exerciseCmd rejected Reject
   submitMustFail merchant do exerciseCmd rejected Accept
 
@@ -181,6 +193,7 @@ testAuthorisation = script do
       cap = 100.0
       spent = 0.0
       expiresAt = deadline
+      instrument = cc registry
       mandateId = "direct"
       charges = 0
   submitMustFail merchant do
@@ -195,6 +208,8 @@ testAuthorisation = script do
       capAtCharge = 100.0
       spentAfter = 1.0
       expiresAtAtCharge = deadline
+      instrument = cc registry
+      settlement = AuthorisedOnly
 
 testRevocation : Script ()
 testRevocation = script do
@@ -202,10 +217,11 @@ testRevocation = script do
   merchant <- allocateParty "Merchant"
   outsider <- allocateParty "Outsider"
   bob      <- allocateParty "Bob"
+  registry <- allocateParty "Registry"
   now      <- getTime
   let deadline = addRelTime now (hours 24)
 
-  prop <- makeProposal alice merchant [bob] 100.0 deadline
+  prop <- makeProposal alice merchant [bob] 100.0 deadline (cc registry)
   m <- submit merchant do exerciseCmd prop Accept
   submitMustFail merchant do exerciseCmd m Revoke
   submitMustFail outsider do exerciseCmd m Revoke
@@ -226,10 +242,11 @@ testAuditTrail = script do
   bob      <- allocateParty "Bob"
   carol    <- allocateParty "Carol"
   outsider <- allocateParty "Outsider"
+  registry <- allocateParty "Registry"
   now      <- getTime
   let deadline = addRelTime now (hours 24)
 
-  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline
+  prop <- makeProposal alice merchant [bob, carol] 100.0 deadline (cc registry)
   m <- submit merchant do exerciseCmd prop Accept
   (m2, r1Cid) <- submit merchant do
     exerciseCmd m Charge with recipient = bob; amount = 10.0
@@ -274,21 +291,22 @@ testMalformedMandates = script do
   alice    <- allocateParty "Alice"
   merchant <- allocateParty "Merchant"
   bob      <- allocateParty "Bob"
+  registry <- allocateParty "Registry"
   now      <- getTime
   let deadline = addRelTime now (hours 24)
 
-  badCap <- makeProposal alice merchant [bob] 0.0 deadline
+  badCap <- makeProposal alice merchant [bob] 0.0 deadline (cc registry)
   submitMustFail merchant do exerciseCmd badCap Accept
-  negativeCap <- makeProposal alice merchant [bob] (-1.0) deadline
+  negativeCap <- makeProposal alice merchant [bob] (-1.0) deadline (cc registry)
   submitMustFail merchant do exerciseCmd negativeCap Accept
-  emptyAllowed <- makeProposal alice merchant [] 100.0 deadline
+  emptyAllowed <- makeProposal alice merchant [] 100.0 deadline (cc registry)
   submitMustFail merchant do exerciseCmd emptyAllowed Accept
-  duplicateAllowed <- makeProposal alice merchant [bob, bob] 100.0 deadline
+  duplicateAllowed <- makeProposal alice merchant [bob, bob] 100.0 deadline (cc registry)
   submitMustFail merchant do exerciseCmd duplicateAllowed Accept
-  sameParty <- makeProposal alice alice [bob] 100.0 deadline
+  sameParty <- makeProposal alice alice [bob] 100.0 deadline (cc registry)
   submitMustFail alice do exerciseCmd sameParty Accept
-  spenderAllowed <- makeProposal alice merchant [merchant] 100.0 deadline
+  spenderAllowed <- makeProposal alice merchant [merchant] 100.0 deadline (cc registry)
   submitMustFail merchant do exerciseCmd spenderAllowed Accept
-  ownerAllowed <- makeProposal alice merchant [alice] 100.0 deadline
+  ownerAllowed <- makeProposal alice merchant [alice] 100.0 deadline (cc registry)
   submitMustFail merchant do exerciseCmd ownerAllowed Accept
   pure ()

@@ -1,0 +1,291 @@
+-- Settlement tests: the mandate controlling real Token Standard value
+-- movement, against the mock registry in TestToken.daml.
+--
+-- The one structural fact these tests lean on: `ChargeAndSettle` validates
+-- the fields of the exact `Transfer` record it then exercises. There are no
+-- separate "policy" amount/recipient arguments anywhere, so the adversarial
+-- tests below attack the only surface that exists: the transfer object
+-- itself, the mandate lifecycle, and the authority model.
+module TestSettlement where
+
+import DA.Time (addRelTime, hours, minutes)
+import DA.Date (Month(Jan), date)
+import DA.Time (time)
+import Daml.Script
+import Mandate
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.TransferInstructionV1
+import TestToken
+
+emptyExtra : ExtraArgs
+emptyExtra = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+mkTransfer : InstrumentId -> Party -> Party -> Decimal -> [ContractId Holding] -> Time -> Transfer
+mkTransfer instrumentId sender receiver amount inputHoldingCids now = Transfer with
+  sender; receiver; amount; instrumentId
+  requestedAt = now
+  executeBefore = addRelTime now (hours 1)
+  inputHoldingCids
+  meta = emptyMetadata
+
+data Setup = Setup with
+  registry   : Party
+  alice      : Party  -- owner: the funding party
+  agent      : Party  -- spender: the AI agent
+  bob        : Party  -- allowed, preapproved: direct settlement
+  carol      : Party  -- allowed, NOT preapproved: offer path
+  outsider   : Party
+  inst       : InstrumentId
+  factoryCid : ContractId TransferFactory
+  holdingCid : ContractId Holding  -- alice's 1000.0 position
+  mandateCid : ContractId Mandate  -- cap 100.0, allowed [bob, carol], 24h
+
+mkSetup : Script Setup
+mkSetup = script do
+  registry <- allocateParty "Registry"
+  alice    <- allocateParty "Alice"
+  agent    <- allocateParty "Agent"
+  bob      <- allocateParty "Bob"
+  carol    <- allocateParty "Carol"
+  outsider <- allocateParty "Outsider"
+  now      <- getTime
+  let inst = InstrumentId with admin = registry; id = "CC"
+  fCid <- submit registry do
+    createCmd MockTransferFactory with
+      admin = registry
+      observers = [alice, agent, outsider]
+      preapproved = [bob]
+  hCid <- submit registry do
+    createCmd MockHolding with
+      admin = registry; owner = alice; instrumentId = inst
+      amount = 1000.0; observers = [agent]
+  prop <- submit alice do
+    createCmd MandateProposal with
+      owner = alice; spender = agent; allowed = [bob, carol]
+      cap = 100.0; expiresAt = addRelTime now (hours 24); instrument = inst
+  mandateCid <- submit agent do exerciseCmd prop Accept
+  pure Setup with
+    registry; alice; agent; bob; carol; outsider; inst
+    factoryCid = toInterfaceContractId fCid
+    holdingCid = toInterfaceContractId hCid
+    mandateCid
+
+-- | Stage B: prove the authority model, do not assume it.
+--
+-- `TransferFactory_Transfer` is controlled by `transfer.sender`. The agent
+-- alone therefore CANNOT exercise it with the owner's money. Inside a Mandate
+-- choice, the authority context is the mandate's signatories (owner AND
+-- spender) plus the choice controller, so the owner's authority is available
+-- for the nested exercise. The mandate contract IS the owner's standing
+-- authorisation, which is exactly the point.
+testNestedAuthority : Script ()
+testNestedAuthority = script do
+  s@Setup{..} <- mkSetup
+  now <- getTime
+  let t = mkTransfer inst alice bob 10.0 [holdingCid] now
+
+  -- The agent, submitting alone, cannot drive the factory directly with the
+  -- owner's transfer: it lacks the owner's authority.
+  submitMustFail agent do
+    exerciseCmd factoryCid TransferFactory_Transfer with
+      expectedAdmin = registry; transfer = t; extraArgs = emptyExtra
+  -- Neither can an outsider.
+  submitMustFail outsider do
+    exerciseCmd factoryCid TransferFactory_Transfer with
+      expectedAdmin = registry; transfer = t; extraArgs = emptyExtra
+
+  -- The owner can, standalone: the factory itself is sound.
+  -- (Done last because it spends the holding.)
+  res <- submit alice do
+    exerciseCmd factoryCid TransferFactory_Transfer with
+      expectedAdmin = registry; transfer = t; extraArgs = emptyExtra
+  case res.output of
+    TransferInstructionResult_Completed {} -> pure ()
+    _ -> abort "expected direct completion for a preapproved receiver"
+
+  -- And the same nested pattern through the mandate works with ONLY the
+  -- agent's signature on the submission: fresh holding, second transfer.
+  h2 <- submit registry do
+    createCmd MockHolding with
+      admin = registry; owner = alice; instrumentId = inst
+      amount = 50.0; observers = [agent]
+  let t2 = mkTransfer inst alice bob 10.0 [toInterfaceContractId h2] now
+  (_, _, res2) <- submit agent do
+    exerciseCmd mandateCid ChargeAndSettle with
+      factoryCid; transfer = t2; extraArgs = emptyExtra
+  case res2.output of
+    TransferInstructionResult_Completed {} -> pure ()
+    _ -> abort "expected direct completion through the mandate"
+
+-- | The direct path: policy checked, value moved, receipt says Settled, and
+-- the receipt's numbers are the settled transfer's numbers because they are
+-- read from the same record.
+testSettleDirect : Script ()
+testSettleDirect = script do
+  s@Setup{..} <- mkSetup
+  now <- getTime
+
+  let t1 = mkTransfer inst alice bob 30.0 [holdingCid] now
+  (m2, r1, res1) <- submit agent do
+    exerciseCmd mandateCid ChargeAndSettle with
+      factoryCid; transfer = t1; extraArgs = emptyExtra
+
+  -- Bob was actually paid, in this transaction.
+  bobHoldings <- query @MockHolding bob
+  assert (sum (map (\(_, h) -> h.amount) bobHoldings) == 30.0)
+  -- The receipt agrees with reality and admits nothing more.
+  Some r <- queryContractId alice r1
+  assert (r.settlement == Settled)
+  assert (r.recipient == bob && r.amount == 30.0)
+  assert (r.instrument == inst)
+  assert (r.spentAfter == 30.0 && r.capAtCharge == 100.0 && r.sequence == 1)
+  Some m <- queryContractId alice m2
+  assert (m.spent == 30.0 && m.charges == 1)
+
+  -- Spend the change from the first settlement in a second charge: the
+  -- factory returned it in the result, no re-query needed.
+  let t2 = mkTransfer inst alice bob 20.0 res1.senderChangeCids now
+  (m3, r2c, _) <- submit agent do
+    exerciseCmd m2 ChargeAndSettle with
+      factoryCid; transfer = t2; extraArgs = emptyExtra
+  Some r2 <- queryContractId alice r2c
+  assert (r2.sequence == 2 && r2.spentAfter == 50.0 && r2.settlement == Settled)
+  bobHoldings2 <- query @MockHolding bob
+  assert (sum (map (\(_, h) -> h.amount) bobHoldings2) == 50.0)
+  -- Alice keeps the rest: 1000 - 30 - 20.
+  aliceHoldings <- query @MockHolding alice
+  assert (sum (map (\(_, h) -> h.amount) aliceHoldings) == 950.0)
+
+-- | The offer path: the receiver has no preapproval, so the Token Standard
+-- result is Pending. The receipt must say so, NOT claim money moved. The
+-- allowance is consumed at authorisation time: the sender's funds are
+-- committed from this moment even though the receiver has not accepted.
+testSettlePending : Script ()
+testSettlePending = script do
+  s@Setup{..} <- mkSetup
+  now <- getTime
+
+  let t = mkTransfer inst alice carol 25.0 [holdingCid] now
+  (m2, rCid, res) <- submit agent do
+    exerciseCmd mandateCid ChargeAndSettle with
+      factoryCid; transfer = t; extraArgs = emptyExtra
+
+  icid <- case res.output of
+    TransferInstructionResult_Pending { transferInstructionCid } ->
+      pure transferInstructionCid
+    _ -> abort "expected a pending instruction for a non-preapproved receiver"
+
+  -- Carol has NOT been paid yet, and the receipt does not pretend she was.
+  carolBefore <- query @MockHolding carol
+  assert (null carolBefore)
+  Some r <- queryContractId alice rCid
+  assert (r.settlement == PendingInstruction icid)
+  -- The allowance is committed regardless.
+  Some m <- queryContractId alice m2
+  assert (m.spent == 25.0)
+
+  -- Carol accepts; only now does the money reach her.
+  _ <- submit carol do
+    exerciseCmd icid TransferInstruction_Accept with extraArgs = emptyExtra
+  carolAfter <- query @MockHolding carol
+  assert (sum (map (\(_, h) -> h.amount) carolAfter) == 25.0)
+
+-- | Everything a malicious caller might try against the settled path. Each
+-- attack is a variation of the ONE transfer object, because that is the only
+-- surface: there are no separate policy parameters to disagree with it.
+testSettleAdversarial : Script ()
+testSettleAdversarial = script do
+  s@Setup{..} <- mkSetup
+  now <- getTime
+  let charge t = exerciseCmd mandateCid ChargeAndSettle with
+        factoryCid; transfer = t; extraArgs = emptyExtra
+
+  -- Exceed the cap outright.
+  submitMustFail agent do charge (mkTransfer inst alice bob 100.01 [holdingCid] now)
+  -- Pay someone off the allow-list, including the parties the policy
+  -- deliberately excludes: the agent itself and the owner.
+  submitMustFail agent do charge (mkTransfer inst alice outsider 10.0 [holdingCid] now)
+  submitMustFail agent do charge (mkTransfer inst alice agent 10.0 [holdingCid] now)
+  submitMustFail agent do charge (mkTransfer inst alice alice 10.0 [holdingCid] now)
+  -- Non-positive amounts.
+  submitMustFail agent do charge (mkTransfer inst alice bob 0.0 [holdingCid] now)
+  submitMustFail agent do charge (mkTransfer inst alice bob (-10.0) [holdingCid] now)
+  -- Substitute the sender: the funding party is the mandate owner, full stop.
+  -- Even with the agent's own funds this must not pass through the mandate.
+  agentHolding <- submit registry do
+    createCmd MockHolding with
+      admin = registry; owner = agent; instrumentId = inst
+      amount = 500.0; observers = []
+  submitMustFail agent do
+    charge (mkTransfer inst agent bob 10.0 [toInterfaceContractId agentHolding] now)
+  -- Wrong instrument under this cap: another token of the same registry, and
+  -- a same-named token of a rogue registry.
+  submitMustFail agent do
+    charge (mkTransfer (InstrumentId registry "OTHER") alice bob 10.0 [holdingCid] now)
+  submitMustFail agent do
+    charge (mkTransfer (InstrumentId outsider "CC") alice bob 10.0 [holdingCid] now)
+  -- Insufficient funding: within the cap, but the inputs cannot cover it.
+  -- The registry's own check fails, the transaction rolls back, and no
+  -- allowance is consumed and no receipt exists.
+  smallHolding <- submit registry do
+    createCmd MockHolding with
+      admin = registry; owner = alice; instrumentId = inst
+      amount = 5.0; observers = [agent]
+  submitMustFail agent do
+    charge (mkTransfer inst alice bob 50.0 [toInterfaceContractId smallHolding] now)
+  Some m <- queryContractId alice mandateCid
+  assert (m.spent == 0.0 && m.charges == 0)
+  receipts <- query @ChargeReceipt alice
+  assert (null receipts)
+
+  -- Sneak past the cap cumulatively: 60 then 50.
+  let t60 = mkTransfer inst alice bob 60.0 [holdingCid] now
+  (m2, _, res) <- submit agent do charge t60
+  let t50 = mkTransfer inst alice bob 50.0 res.senderChangeCids now
+  submitMustFail agent do
+    exerciseCmd m2 ChargeAndSettle with
+      factoryCid; transfer = t50; extraArgs = emptyExtra
+  -- The exact remainder still works.
+  let t40 = mkTransfer inst alice bob 40.0 res.senderChangeCids now
+  (m3, _, _) <- submit agent do
+    exerciseCmd m2 ChargeAndSettle with
+      factoryCid; transfer = t40; extraArgs = emptyExtra
+  -- And then the mandate is exhausted.
+  submitMustFail agent do
+    exerciseCmd m3 ChargeAndSettle with
+      factoryCid; transfer = (mkTransfer inst alice bob 0.01 [holdingCid] now)
+      extraArgs = emptyExtra
+
+-- | Revocation kills settlement instantly; the agent cannot block it.
+testSettleAfterRevocation : Script ()
+testSettleAfterRevocation = script do
+  s@Setup{..} <- mkSetup
+  now <- getTime
+  submit alice do exerciseCmd mandateCid Revoke
+  submitMustFail agent do
+    exerciseCmd mandateCid ChargeAndSettle with
+      factoryCid
+      transfer = mkTransfer inst alice bob 1.0 [holdingCid] now
+      extraArgs = emptyExtra
+
+-- | Expiry kills settlement the moment the deadline passes.
+testSettleAfterExpiry : Script ()
+testSettleAfterExpiry = script do
+  setTime (time (date 2025 Jan 1) 0 0 0)
+  s@Setup{..} <- mkSetup
+  passTime (hours 23)
+  now <- getTime
+  -- Still inside the window: fine.
+  (m2, _, res) <- submit agent do
+    exerciseCmd mandateCid ChargeAndSettle with
+      factoryCid
+      transfer = mkTransfer inst alice bob 1.0 [holdingCid] now
+      extraArgs = emptyExtra
+  passTime (hours 1) >> passTime (minutes 1)
+  now2 <- getTime
+  submitMustFail agent do
+    exerciseCmd m2 ChargeAndSettle with
+      factoryCid
+      transfer = mkTransfer inst alice bob 1.0 res.senderChangeCids now2
+      extraArgs = emptyExtra
