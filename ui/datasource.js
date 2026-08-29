@@ -145,30 +145,94 @@ export class FixtureDataSource {
   }
 }
 
-// Skeleton for the real adapter. Target architecture:
+// The real adapter. Architecture:
 //
-//   browser -> localhost API -> agent_session.py -> charge_and_settle -> Canton
+//   browser -> bridge.py (loopback HTTP) -> agent_session -> charge_and_settle -> Canton
 //
-// The browser NEVER holds C8 client secrets or bearer tokens; the
-// localhost API owns credentials and the browser sees only outcomes.
-// Only this class may report mode "live".
+// The browser NEVER holds Keycloak secrets, bearer tokens, Canton
+// credentials, or LLM keys; bridge.py owns credentials and the browser
+// sees only outcomes. LiveDataSource sends exactly one header
+// (Content-Type) and one field ({ text }). Only this class may report
+// mode "live".
+//
+// The `checks` list on a decision is DISPLAY, derived locally from the
+// pre-charge snapshot via evaluate(); enforcement happened in Daml and
+// the authoritative verdict is the bridge's `decision`/`reason`.
 export class LiveDataSource {
   mode = "live";
 
-  constructor(baseUrl = "http://localhost:8917") {
+  constructor(baseUrl = "http://127.0.0.1:8917") {
     this.baseUrl = baseUrl;
+    this.readTimeoutMs = 15_000;
+    this.intentTimeoutMs = 90_000; // a Canton settlement can be slow
+  }
+
+  async #fetch(path, { method = "GET", body, timeoutMs } = {}) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs ?? this.readTimeoutMs);
+    let resp;
+    try {
+      resp = await fetch(this.baseUrl + path, {
+        method,
+        signal: ctl.signal,
+        ...(body !== undefined && {
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      });
+    } catch (err) {
+      const kind = err?.name === "AbortError" ? "timeout" : "unreachable";
+      throw Object.assign(new Error(`bridge ${kind}: ${path}`), { kind });
+    } finally {
+      clearTimeout(timer);
+    }
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw Object.assign(
+        new Error(data.reason ?? data.error ?? `bridge HTTP ${resp.status}`),
+        { kind: "http", status: resp.status, data },
+      );
+    }
+    return data;
+  }
+
+  async health() {
+    return this.#fetch("/api/health");
   }
 
   async getAuthorityState() {
-    throw new Error("LiveDataSource not implemented: GET /authority");
+    return this.#fetch("/api/state");
   }
 
   async getActivity() {
-    throw new Error("LiveDataSource not implemented: GET /activity");
+    return this.#fetch("/api/activity");
   }
 
-  async submitIntent(_text) {
-    throw new Error("LiveDataSource not implemented: POST /intent");
+  async submitIntent(text) {
+    let r;
+    try {
+      r = await this.#fetch("/api/intent", {
+        method: "POST",
+        body: { text },
+        timeoutMs: this.intentTimeoutMs,
+      });
+    } catch (err) {
+      if (err.kind === "http" && err.data?.decision === "unparsed") {
+        return { intent: null, decision: "unparsed" };
+      }
+      if (err.kind === "http" && err.data?.decision === "error") {
+        // Ambiguous write: the bridge did NOT retry, and neither do we.
+        return {
+          intent: null,
+          decision: "error",
+          ambiguous: Boolean(err.data.ambiguous),
+          reason: err.data.reason ?? String(err.message),
+        };
+      }
+      throw err; // timeout / unreachable: the caller degrades the connection
+    }
+    if (r.decision !== "accepted" && r.decision !== "rejected") return r;
+    return { ...r, checks: evaluate(r.before, r.intent).checks };
   }
 
   async reset() {

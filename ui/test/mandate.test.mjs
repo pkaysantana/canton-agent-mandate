@@ -6,7 +6,7 @@ import { readFile } from "node:fs/promises";
 
 import { parseIntent, evaluate, applySettlement, toMils, fmtCC } from "../mandate.js";
 import { FixtureDataSource, LiveDataSource } from "../datasource.js";
-import { badgeForMode, decisionView } from "../presenter.js";
+import { badgeForMode, badgeForConnection, CONNECTION_STATES, decisionView } from "../presenter.js";
 
 const STATE = {
   walletBalance: "4.997",
@@ -88,6 +88,18 @@ test("only live mode gets the live badge", () => {
   const b = badgeForMode("live");
   assert.equal(b.live, true);
   assert.equal(b.text, "CANTON DEVNET · LIVE");
+});
+
+test("of all connection states, exactly one reads LIVE", () => {
+  const liveStates = CONNECTION_STATES.filter(
+    (s) => badgeForConnection(s).text.includes("LIVE"),
+  );
+  assert.deepEqual(liveStates, ["live"]);
+  for (const s of ["connecting", "degraded", "disconnected", "replay", undefined, "banana"]) {
+    assert.equal(badgeForConnection(s).live, false, `state ${s} must not be live`);
+  }
+  assert.equal(badgeForConnection("replay").text, "DEMO · VERIFIED ON DEVNET");
+  assert.equal(badgeForConnection(undefined).conn, "replay"); // fail-safe
 });
 
 test("data sources declare their mode", () => {

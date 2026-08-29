@@ -125,6 +125,21 @@ b, .keystat-value, .usage-caption, .proposed-amount, .verdict-sub,
   50%      { box-shadow: 0 0 0 5px rgba(243,255,151,0); }
 }
 
+/* Connection states other than live stay visibly non-live. */
+.net-badge[data-mode="connecting"] .net-dot { background: var(--muted); }
+.net-badge[data-mode="degraded"],
+.net-badge[data-mode="disconnected"] { color: var(--text); border-color: #3a3f47; }
+.net-badge[data-mode="degraded"] .net-dot,
+.net-badge[data-mode="disconnected"] .net-dot { background: var(--muted); }
+
+.live-note {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  border-left: 2px solid var(--line);
+  padding-left: 10px;
+}
+
 /* ── Layout ─────────────────────────────────────────── */
 
 .layout {

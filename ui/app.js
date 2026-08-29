@@ -2,21 +2,36 @@
 // DataSource seam (datasource.js); what to show comes only from the
 // presenter (presenter.js); this file renders.
 
-import { FixtureDataSource } from "./datasource.js";
-import { badgeForMode, decisionView } from "./presenter.js";
+import { FixtureDataSource, LiveDataSource } from "./datasource.js";
+import { badgeForConnection, decisionView } from "./presenter.js";
 import { toMils, fmtCC } from "./mandate.js";
 
-const source = new FixtureDataSource();
+// ?mode=live selects the real bridge; anything else is the honest replay.
+const MODE = new URLSearchParams(location.search).get("mode") === "live"
+  ? "live" : "replay";
+const source = MODE === "live" ? new LiveDataSource() : new FixtureDataSource();
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/* ── Network badge: derived strictly from source.mode ── */
+/* ── Connection state: the ONLY source of the badge ──────
+   "live" is set in exactly one place, after /api/health AND /api/state
+   both succeeded against the real bridge. */
 
-function renderBadge() {
-  const badge = badgeForMode(source.mode);
-  $("net-badge").dataset.mode = badge.live ? "live" : "fixture";
+let conn = MODE === "live" ? "connecting" : "replay";
+
+function setConn(next, note) {
+  conn = next;
+  const badge = badgeForConnection(conn);
+  $("net-badge").dataset.mode = badge.conn;
   $("net-badge-text").textContent = badge.text;
+  const el = $("live-note");
+  if (note) {
+    el.textContent = note;
+    el.hidden = false;
+  } else {
+    el.hidden = true;
+  }
 }
 
 /* ── Authority panel ─────────────────────────────────── */
@@ -199,7 +214,20 @@ async function submit(text) {
   $("decision").hidden = true;
 
   const pipelineDone = runPipeline();
-  const result = await source.submitIntent(text);
+  let result;
+  try {
+    result = await source.submitIntent(text);
+  } catch (err) {
+    await pipelineDone;
+    resetPipeline();
+    // Transport failure: nothing to render as a ledger decision.
+    setConn(err.kind === "timeout" ? "degraded" : "disconnected",
+      err.kind === "timeout"
+        ? "The bridge did not answer in time. The request was not retried — check the bridge, then refresh."
+        : "Cannot reach the local bridge. Start bridge.py, or reload with ?mode=replay.");
+    setBusy(false);
+    return;
+  }
   await pipelineDone;
 
   if (result.decision === "unparsed") {
@@ -208,6 +236,18 @@ async function submit(text) {
     setBusy(false);
     return;
   }
+
+  if (result.decision === "error") {
+    resetPipeline();
+    setConn("degraded", result.ambiguous
+      ? "Outcome unknown: the charge may or may not have committed. It was NOT retried; the session will re-resolve the current Mandate. Refreshing state…"
+      : `Bridge error: ${result.reason}`);
+    if (MODE === "live") refreshLive(false);
+    setBusy(false);
+    return;
+  }
+
+  if (MODE === "live") setConn("live");
 
   const view = decisionView(result);
   settlePipeline(view.state === "accepted");
@@ -254,6 +294,31 @@ document.querySelectorAll(".chip").forEach((chip) => {
 
 $("reset").addEventListener("click", resetDemo);
 
-renderBadge();
-source.getAuthorityState().then(renderAuthority);
-renderActivity(false);
+/* ── Init ────────────────────────────────────────────── */
+
+// Refresh live state; read-only on the ledger, safe on browser refresh.
+async function refreshLive(includeHealth) {
+  try {
+    if (includeHealth) {
+      const health = await source.health();
+      if (!health.ok) throw Object.assign(new Error("bridge unhealthy"), { kind: "http" });
+    }
+    renderAuthority(await source.getAuthorityState());
+    await renderActivity(false);
+    setConn("live");
+  } catch (err) {
+    setConn(err.kind === "unreachable" ? "disconnected" : "degraded",
+      err.kind === "unreachable"
+        ? "Cannot reach the local bridge. Start bridge.py, or reload with ?mode=replay."
+        : `Bridge reachable but state unavailable: ${err.message}`);
+  }
+}
+
+setConn(conn);
+if (MODE === "live") {
+  $("reset").hidden = true; // the ledger is real; there is nothing to reset
+  refreshLive(true);
+} else {
+  source.getAuthorityState().then(renderAuthority);
+  renderActivity(false);
+}

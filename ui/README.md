@@ -22,12 +22,16 @@ modules need `http://`, not `file://`.)
 
 ## Mode honesty
 
-The header badge is derived strictly from the data source's `mode`:
+The console has two launch modes (`?mode=replay` is the default):
 
-- `fixture` → **DEMO · VERIFIED ON DEVNET** — deterministic local replay.
-  Never presented as live.
-- `live` → **CANTON DEVNET · LIVE** — reserved for a real adapter
-  (`LiveDataSource`); nothing in fixture mode can show it.
+- `?mode=replay` → `FixtureDataSource`, badge **DEMO · VERIFIED ON
+  DEVNET** — deterministic local replay. Never presented as live.
+- `?mode=live` → `LiveDataSource` over the local `bridge.py` (see
+  `../LIVE_CONSOLE.md`), badge **CANTON DEVNET · LIVE** — shown only
+  after `/api/health` and `/api/state` both succeed. Until then, and on
+  any failure, the badge reads CONNECTING / DEGRADED / UNREACHABLE; the
+  connection-state model is `replay | connecting | live | degraded |
+  disconnected`, and exactly one state may read LIVE (tested).
 
 ## Demo flow
 
