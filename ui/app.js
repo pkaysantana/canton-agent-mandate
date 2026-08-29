@@ -1,13 +1,23 @@
-// Agent Mandate — demo screen wiring. All data flows through the
-// DataSource seam (datasource.js); this file only renders.
+// Agent Mandate — demo screen wiring. Data comes only from the
+// DataSource seam (datasource.js); what to show comes only from the
+// presenter (presenter.js); this file renders.
 
 import { FixtureDataSource } from "./datasource.js";
+import { badgeForMode, decisionView } from "./presenter.js";
 import { toMils, fmtCC } from "./mandate.js";
 
 const source = new FixtureDataSource();
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ── Network badge: derived strictly from source.mode ── */
+
+function renderBadge() {
+  const badge = badgeForMode(source.mode);
+  $("net-badge").dataset.mode = badge.live ? "live" : "fixture";
+  $("net-badge-text").textContent = badge.text;
+}
 
 /* ── Authority panel ─────────────────────────────────── */
 
@@ -17,11 +27,9 @@ function renderAuthority(state) {
   $("spent").textContent = state.spent;
   $("remaining").textContent = state.remaining;
   const cap = toMils(state.cap);
-  const spent = toMils(state.spent);
-  const pct = cap ? (spent / cap) * 100 : 0;
+  const pct = cap ? (toMils(state.spent) / cap) * 100 : 0;
   $("authbar-fill").style.width = `${pct}%`;
   $("authbar").setAttribute("aria-valuenow", state.spent);
-  $("authbar-label").textContent = `${state.spent} / ${state.cap} CC`;
 }
 
 // Tween a numeric field from -> to over ~700ms, then flash it.
@@ -53,7 +61,6 @@ function animateAuthority(before, after) {
   const cap = toMils(after.cap);
   $("authbar-fill").style.width = `${(toMils(after.spent) / cap) * 100}%`;
   $("authbar").setAttribute("aria-valuenow", after.spent);
-  $("authbar-label").textContent = `${after.spent} / ${after.cap} CC`;
 }
 
 // Briefly show how far an over-cap request would overshoot the bar.
@@ -97,60 +104,45 @@ function settlePipeline(accepted) {
 
 /* ── Decision panel ──────────────────────────────────── */
 
-const cap1 = (s) => s.charAt(0).toUpperCase() + s.slice(1);
-
-function renderDecision(result) {
+function renderDecision(view) {
   const panel = $("decision");
   panel.hidden = false;
   panel.classList.remove("accepted", "rejected");
   void panel.offsetWidth; // restart entry/stamp animations
-  panel.classList.add(result.decision);
+  panel.classList.add(view.state);
 
-  $("p-recipient").textContent = cap1(result.intent.recipient);
-  $("p-amount").textContent = fmtCC(toMils(result.intent.amount));
-  $("p-reason").textContent = result.intent.reason;
+  $("p-recipient").textContent = view.recipient;
+  $("p-amount").textContent = fmtCC(toMils(view.amount));
+  $("p-reason").textContent = view.reason;
 
   const afford = $("afford");
-  if (result.decision === "rejected" && result.reason === "charge would exceed the cap") {
-    $("afford-wallet").textContent = result.before.walletBalance;
-    $("afford-remaining").textContent = result.before.remaining;
+  if (view.afford) {
+    $("afford-wallet").textContent = view.afford.wallet;
+    $("afford-remaining").textContent = view.afford.remaining;
     afford.hidden = false;
   } else {
     afford.hidden = true;
   }
 
-  if (result.decision === "accepted") {
-    $("verdict-badge").textContent = "ACCEPTED";
-    $("verdict-sub").textContent = `${result.settledAmount} CC settled`;
-    $("verdict-note").textContent = "Mandate advanced";
-  } else {
-    $("verdict-badge").textContent = "REJECTED";
-    $("verdict-sub").textContent = "0 CC moved";
-    $("verdict-note").textContent = `“${result.reason}”`;
-  }
+  $("verdict-badge").textContent = view.badge;
+  $("verdict-sub").textContent = view.sub;
+  $("verdict-note").textContent = view.note;
 
   const checks = $("checks");
   checks.innerHTML = "";
-  for (const c of result.checks) {
+  for (const c of view.checks) {
     const li = document.createElement("li");
     li.className = c.ok ? "ok" : "bad";
-    const label = c.invertLabel && c.ok ? "Within remaining delegated authority" : c.label;
-    li.innerHTML = `<span class="mark">${c.ok ? "✓" : "✕"}</span><b></b>`;
-    li.querySelector("b").textContent = label;
+    li.innerHTML = `<span class="mark" aria-hidden="true">${c.ok ? "✓" : "✕"}</span><b></b>`;
+    li.querySelector("b").textContent = `${c.label}${c.ok ? "" : " — failed"}`;
     checks.appendChild(li);
   }
-  $("checks-disclosure").open = result.decision === "rejected";
+  $("checks-disclosure").open = view.openChecks;
   $("proof-disclosure").open = false;
 
   const proof = $("proof");
   proof.innerHTML = "";
-  const rows = [
-    ["Mandate CID", result.proof.mandateCid],
-    ["Update ID", result.proof.updateId],
-  ];
-  if (result.proof.receiptCid) rows.push(["Receipt CID", result.proof.receiptCid]);
-  if (result.proof.damlError) rows.push(["Daml rejection", result.proof.damlError, "err"]);
-  for (const [k, v, cls] of rows) {
+  for (const [k, v, cls] of view.proofRows) {
     const div = document.createElement("div");
     const dt = document.createElement("dt");
     const dd = document.createElement("dd");
@@ -169,15 +161,17 @@ function activityRow(entry, isNew) {
   li.className = entry.decision + (isNew ? " new" : "");
   const verb = entry.decision === "accepted" ? "Settled" : "Rejected";
   li.innerHTML = `
-    <span class="act-dot"></span>
+    <span class="act-dot" aria-hidden="true"></span>
     <span class="act-main">
       <span class="act-head">
         <span><span class="act-verb">${verb}</span>
         <span class="act-amount"></span></span>
+        <span class="act-time"></span>
       </span>
       <span class="act-sub"></span>
     </span>`;
   li.querySelector(".act-amount").textContent = ` ${entry.amount} CC → ${entry.recipient}`;
+  li.querySelector(".act-time").textContent = entry.at ?? "";
   li.querySelector(".act-sub").textContent = entry.reason ? `· ${entry.reason}` : "";
   return li;
 }
@@ -193,10 +187,15 @@ async function renderActivity(newest) {
 
 let running = false;
 
+function setBusy(busy) {
+  running = busy;
+  $("send").disabled = busy;
+  document.querySelector(".center").setAttribute("aria-busy", String(busy));
+}
+
 async function submit(text) {
   if (running || !text.trim()) return;
-  running = true;
-  $("send").disabled = true;
+  setBusy(true);
   $("decision").hidden = true;
 
   const pipelineDone = runPipeline();
@@ -204,27 +203,38 @@ async function submit(text) {
   await pipelineDone;
 
   if (result.decision === "unparsed") {
-    settlePipeline(false);
     resetPipeline();
     $("composer").placeholder = "Try: Pay pharmacy 0.001 CC for medicine";
-    running = false;
-    $("send").disabled = false;
+    setBusy(false);
     return;
   }
 
-  settlePipeline(result.decision === "accepted");
-  renderDecision(result);
+  const view = decisionView(result);
+  settlePipeline(view.state === "accepted");
+  renderDecision(view);
   await renderActivity(true);
 
-  if (result.decision === "accepted") {
+  if (view.state === "accepted") {
     await sleep(350);
     animateAuthority(result.before, result.after);
-  } else if (result.reason === "charge would exceed the cap") {
+  } else if (view.afford) {
     flashOvershoot(result.before, toMils(result.intent.amount));
   }
 
-  running = false;
-  $("send").disabled = false;
+  setBusy(false);
+}
+
+/* ── Reset (fixture only) ────────────────────────────── */
+
+async function resetDemo() {
+  if (running) return;
+  await source.reset();
+  resetPipeline();
+  $("decision").hidden = true;
+  $("composer").value = "";
+  $("authbar-ghost").style.width = "0";
+  renderAuthority(await source.getAuthorityState());
+  await renderActivity(false);
 }
 
 /* ── Wire up ─────────────────────────────────────────── */
@@ -242,9 +252,8 @@ document.querySelectorAll(".chip").forEach((chip) => {
   });
 });
 
-document.querySelector(".revoke").addEventListener("click", () => {
-  // Non-functional in the demo: owner-side control, shown for completeness.
-});
+$("reset").addEventListener("click", resetDemo);
 
+renderBadge();
 source.getAuthorityState().then(renderAuthority);
 renderActivity(false);

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent Mandate — Financial authority for autonomous agents</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,7 +13,7 @@
   <header class="header">
     <div class="brand">
       <div class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6">
           <path d="M12 2.5 4 6v6c0 4.6 3.4 8.4 8 9.5 4.6-1.1 8-4.9 8-9.5V6l-8-3.5z"/>
           <path d="M8.5 12l2.4 2.4 4.6-4.8"/>
         </svg>
@@ -22,65 +23,67 @@
         <p class="tagline">Financial authority for autonomous agents</p>
       </div>
     </div>
-    <div class="net-badge" title="Connected to Canton DevNet">
-      <span class="net-dot"></span> DEVNET LIVE
+    <div class="net-badge" id="net-badge" data-mode="fixture">
+      <span class="net-dot" aria-hidden="true"></span>
+      <span id="net-badge-text">DEMO · VERIFIED ON DEVNET</span>
     </div>
   </header>
 
   <main class="layout">
 
-    <!-- ── Authority panel ─────────────────────────────── -->
+    <!-- ── Authority ───────────────────────────────────── -->
     <section class="panel authority" aria-labelledby="authority-h">
-      <h2 id="authority-h" class="panel-title">Delegated authority</h2>
-
-      <div class="stat wallet">
-        <span class="stat-label">Wallet balance</span>
-        <span class="stat-value"><b id="wallet">4.997</b> <i>CC</i></span>
+      <div class="panel-head">
+        <h2 id="authority-h" class="panel-title">Delegated authority</h2>
+        <p class="identity">Procurement Agent · Mandate M-001</p>
       </div>
 
-      <div class="stat-grid">
-        <div class="stat">
-          <span class="stat-label">Mandate cap</span>
-          <span class="stat-value"><b id="cap">0.010</b> <i>CC</i></span>
+      <div class="keystats">
+        <div class="keystat">
+          <span class="keystat-label">Funds available</span>
+          <span class="keystat-value"><b id="wallet">4.997</b> <i>CC</i></span>
         </div>
-        <div class="stat">
-          <span class="stat-label">Spent</span>
-          <span class="stat-value"><b id="spent">0.003</b> <i>CC</i></span>
+        <div class="keystat authority-stat">
+          <span class="keystat-label">Agent authority</span>
+          <span class="keystat-value"><b id="remaining">0.007</b> <i>CC remaining</i></span>
         </div>
       </div>
 
-      <div class="remaining-block">
-        <div class="remaining-head">
-          <span class="stat-label">Remaining authority</span>
-          <span class="stat-value"><b id="remaining">0.007</b> <i>CC</i></span>
-        </div>
-        <div class="authbar" role="progressbar" aria-label="Mandate usage"
+      <div class="usage">
+        <div class="authbar" role="progressbar" aria-label="Mandate authority used"
              aria-valuemin="0" aria-valuemax="0.010" aria-valuenow="0.003" id="authbar">
           <div class="authbar-fill" id="authbar-fill"></div>
           <div class="authbar-ghost" id="authbar-ghost"></div>
         </div>
-        <div class="authbar-caption"><span id="authbar-label">0.003 / 0.010 CC</span> delegated cap</div>
+        <p class="usage-caption">
+          <span id="authbar-label"><b id="spent">0.003</b> / <b id="cap">0.010</b> CC</span> used
+        </p>
       </div>
 
       <dl class="meta">
-        <div><dt>Allowed recipients</dt><dd id="recipients"><span class="pill">✓ Pharmacy</span></dd></div>
-        <div><dt>Status</dt><dd><span class="status-active" id="status">Active</span></dd></div>
-        <div><dt>Expiry</dt><dd>30 Aug 2026 · 15:50 UTC</dd></div>
+        <div><dt>Allowed recipients</dt><dd id="recipients">✓ Pharmacy</dd></div>
+        <div><dt>Status</dt><dd id="status">● Active</dd></div>
+        <div><dt>Expires</dt><dd>30 Aug 2026 · 15:50 UTC</dd></div>
       </dl>
 
-      <button class="revoke" type="button" title="Owner-only control (demo)">Revoke mandate</button>
+      <div class="owner-controls">
+        <span class="owner-label">Owner controls</span>
+        <button class="revoke" type="button" disabled
+                title="Owner-side control — not part of this demo">Revoke mandate</button>
+      </div>
     </section>
 
-    <!-- ── Center: request, pipeline, decision ─────────── -->
-    <section class="center">
+    <!-- ── Request + decision ──────────────────────────── -->
+    <section class="center" aria-labelledby="request-h">
 
       <div class="panel composer-panel">
-        <h2 class="panel-title">Agent request</h2>
+        <h2 id="request-h" class="panel-title">Agent request</h2>
         <form id="composer-form" class="composer" autocomplete="off">
+          <label class="sr-only" for="composer">Ask your agent to make a payment</label>
           <input id="composer" type="text" spellcheck="false"
-                 placeholder="Ask your agent to make a payment..." aria-label="Agent request">
+                 placeholder="Ask your agent to make a payment...">
           <button type="submit" id="send" aria-label="Send request">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <path d="M5 12h13M13 6l6 6-6 6"/>
             </svg>
           </button>
@@ -95,37 +98,33 @@
         </div>
       </div>
 
-      <div class="pipeline" id="pipeline" aria-label="Decision pipeline">
-        <div class="stage" data-stage="0"><span class="stage-dot"></span><span class="stage-name">User request</span></div>
-        <div class="stage-link"></div>
-        <div class="stage" data-stage="1"><span class="stage-dot"></span><span class="stage-name">AI intent</span></div>
-        <div class="stage-link"></div>
-        <div class="stage" data-stage="2"><span class="stage-dot"></span><span class="stage-name">Daml authority</span></div>
-        <div class="stage-link"></div>
-        <div class="stage" data-stage="3"><span class="stage-dot"></span><span class="stage-name">Canton settlement</span></div>
-      </div>
+      <ol class="pipeline" id="pipeline" aria-label="Decision pipeline">
+        <li class="stage" data-stage="0"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">User request</span></li>
+        <li class="stage-link" aria-hidden="true"></li>
+        <li class="stage" data-stage="1"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">AI intent</span></li>
+        <li class="stage-link" aria-hidden="true"></li>
+        <li class="stage" data-stage="2"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">Daml authority</span></li>
+        <li class="stage-link" aria-hidden="true"></li>
+        <li class="stage" data-stage="3"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">Canton ledger</span></li>
+      </ol>
 
-      <div class="panel decision-panel" id="decision" hidden>
+      <div class="panel decision-panel" id="decision" hidden aria-live="polite">
         <div class="decision-cols">
           <div class="proposed">
             <h3 class="kicker">AI proposed action</h3>
-            <div class="proposed-body">
-              <div class="proposed-recipient" id="p-recipient">Pharmacy</div>
-              <div class="proposed-amount"><b id="p-amount">0.001</b> <i>CC</i></div>
-              <div class="proposed-reason" id="p-reason">Medicine</div>
-              <div class="afford" id="afford" hidden>
-                <span class="afford-line ok">Wallet balance <b id="afford-wallet">4.996</b> CC · ✓ sufficient</span>
-                <span class="afford-line no">Delegated authority <b id="afford-remaining">0.006</b> CC · exceeded</span>
-              </div>
+            <div class="proposed-recipient" id="p-recipient">Pharmacy</div>
+            <div class="proposed-amount"><b id="p-amount">0.001</b> <i>CC</i></div>
+            <div class="proposed-reason" id="p-reason">Medicine</div>
+            <div class="afford" id="afford" hidden>
+              <span class="afford-line ok">✓ Wallet <b id="afford-wallet">4.996</b> CC · sufficient</span>
+              <span class="afford-line no">✕ Authority <b id="afford-remaining">0.006</b> CC · insufficient</span>
             </div>
           </div>
           <div class="verdict">
             <h3 class="kicker">Canton decision</h3>
-            <div class="verdict-body" id="verdict-body">
-              <div class="verdict-badge" id="verdict-badge">ACCEPTED</div>
-              <div class="verdict-sub" id="verdict-sub">0.001 CC settled</div>
-              <div class="verdict-note" id="verdict-note">Mandate advanced</div>
-            </div>
+            <div class="verdict-badge" id="verdict-badge">SETTLED</div>
+            <div class="verdict-sub" id="verdict-sub">0.001 CC settled</div>
+            <div class="verdict-note" id="verdict-note">Mandate advanced</div>
           </div>
         </div>
 
@@ -145,7 +144,10 @@
 
     <!-- ── Activity ────────────────────────────────────── -->
     <section class="panel activity-panel" aria-labelledby="activity-h">
-      <h2 id="activity-h" class="panel-title">Activity</h2>
+      <div class="panel-head row">
+        <h2 id="activity-h" class="panel-title">Activity</h2>
+        <button class="reset" id="reset" type="button" title="Restore the demo fixture state">Reset demo</button>
+      </div>
       <ol class="activity" id="activity"></ol>
     </section>
 
