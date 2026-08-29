@@ -228,12 +228,67 @@ template DupChangeFactory
                               toInterfaceContractId @Holding changeCid]
           meta = emptyMetadata
 
+-- | An unrelated owner-controlled contract, TEST ONLY. Stands in for
+-- anything else the owner can authorise - another vault, a second mandate,
+-- a governance choice. `Drain` is owner-controlled and consuming.
+template OwnerVault
+  with
+    owner    : Party
+    attacker : Party
+  where
+    signatory owner
+    observer attacker
+    choice Drain : ()
+      controller owner
+      do pure ()  -- a real vault would move funds; the point is that the
+                  -- choice FIRED at all, under owner authority the owner
+                  -- never meant to lend to a transfer factory
+
+-- | MALICIOUS factory #3: once the OWNER is deceived into pinning it, it
+-- abuses the owner authority delegated through the nested mandate
+-- transaction to exercise an UNRELATED owner-controlled contract
+-- (`OwnerVault.Drain`), then reports the transfer as Completed without
+-- moving anything - a tight lie (input == charged amount) that slips past
+-- gross-debit accounting so the drain rides along inside a normal-looking,
+-- in-policy charge.
+--
+-- This is the residual trust boundary made concrete: a malicious-but-vetted
+-- factory wields the owner's delegated authority for MORE than the transfer.
+-- No mandate policy check can bound it - only package vetting can keep such
+-- an implementation off the participant in the first place.
+template AuthorityStealingFactory
+  with
+    admin       : Party
+    observers   : [Party]
+    targetVault : ContractId OwnerVault
+  where
+    signatory admin
+    observer observers
+
+    interface instance TransferFactory for AuthorityStealingFactory where
+      view = TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_publicFetchImpl _self _arg =
+        pure TransferFactoryView with admin; meta = emptyMetadata
+      transferFactory_transferImpl _self _arg = do
+        -- The theft: exercise the owner's unrelated contract using the
+        -- owner authority present in this nested body (the choice controller
+        -- is transfer.sender == owner). Then lie that the transfer
+        -- completed - touching no holdings, so with a tight input the
+        -- mandate's gross-debit check is satisfied.
+        exercise targetVault Drain
+        pure TransferInstructionResult with
+          output = TransferInstructionResult_Completed with
+            receiverHoldingCids = []
+          senderChangeCids = []
+          meta = emptyMetadata
+
 -- | MALICIOUS factory #2: tries to actually consume the real registry's
--- holdings without paying (the first step of any substitution/theft). This
--- FAILS on authority: archiving a MockHolding needs its signatory (the real
--- registry admin), and inside this factory's choice body the available
--- authority is only this factory's signatory plus the sender. Canton's
--- authorisation model - not the mandate - is what stops cross-package theft.
+-- holdings without paying. This FAILS on authority: archiving a MockHolding
+-- needs its signatory (the real registry admin), which this factory does
+-- NOT have. Note the boundary precisely: Canton authorisation stops it from
+-- touching holdings signed by a DIFFERENT party (the registry), but it does
+-- NOT stop a malicious factory from touching contracts the OWNER can
+-- authorise - see AuthorityStealingFactory for that.
 template SubstitutingFactory
   with
     admin     : Party

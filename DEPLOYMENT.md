@@ -1,7 +1,21 @@
 # DevNet deployment: agent-mandate DAR
 
-Prepared checklist. Nothing here has been executed against DevNet. Gate G1
-must pass before anything is uploaded.
+Prepared checklist. Nothing here has been executed against DevNet.
+
+## RESOLVED by the integration pass
+
+- **Exact Token Standard V1 DAR identities** - the three official DevNet
+  interface DARs are saved in `daml-starter/token-standard/official/`, and
+  their package IDs are recorded below.
+- **Source-rebuild package mismatch** - both packages now compile against
+  those official DARs, not our source rebuilds. The old rebuilt IDs
+  (`a2b71e27…` metadata, `4787754c…` holding, `a1d7f008…` transfer-instr.)
+  are no longer referenced by the build; the upstream source is kept under
+  `token-standard/splice-api-token-*-v1/` as reference only.
+- **Clean production DAR packaging** - the deployable
+  `agent-mandate-0.1.0.dar` contains only `Mandate` plus the three official
+  interface packages: no `daml-script`, no tests, no mock/malicious
+  factories, no Iou. Verified by `inspect-dar` (see below).
 
 ## The artefact
 
@@ -13,79 +27,56 @@ daml build --all
 
 | DAR | Purpose | Deploy? |
 |---|---|---|
-| `daml-starter/mandate/.daml/dist/agent-mandate-0.1.0.dar` | Mandate + the three Token Standard interface packages | **YES - this one only** |
+| `daml-starter/mandate/.daml/dist/agent-mandate-0.1.0.dar` | Mandate + the three official Token Standard interface packages | **YES - this one only** |
 | `daml-starter/.daml/dist/daml-starter-0.0.1.dar` | tests, mock registry, malicious mock factories, daml-script | **NEVER** |
 
-Local package identities as of this commit (from
+Package identities in the deployable DAR (from
 `daml damlc inspect-dar mandate/.daml/dist/agent-mandate-0.1.0.dar`):
 
-| Package | Version | Local package-id |
+| Package | Version | Package-id |
 |---|---|---|
-| `agent-mandate` | 0.1.0 | `c9b0c9967704bbb7e70bad5eefd557a689cdf8d13ad66ecdb4b02290c475412f` |
-| `splice-api-token-metadata-v1` | 1.0.0 | `a2b71e271f87b8d5282607f079262355eb2e42e20857613a47fce290fc3b3cde` |
-| `splice-api-token-holding-v1` | 1.0.0 | `4787754c493877d34db18aae4889cb96e07f1979ca758f5d15017606ece9d0cd` |
-| `splice-api-token-transfer-instruction-v1` | 1.0.0 | `a1d7f008c9e8b4400e829fabc5fe1d1b6d201b9d514d37f4e723da7e51bd7817` |
+| `agent-mandate` | 0.1.0 | `47ead15bf3b4d49bdee259a473fa8216e97226af4e752869f57c4f5f2c0cdf09` |
+| `splice-api-token-metadata-v1` | 1.0.0 | `4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f` |
+| `splice-api-token-holding-v1` | 1.0.0 | `718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b` |
+| `splice-api-token-transfer-instruction-v1` | 1.0.0 | `55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281` |
 
-The three `splice-api-token-*-v1` packages are VENDORED SOURCE REBUILDS
-(from the Splice repo at tag 0.6.8, compiled with SDK 3.4.10 instead of
-upstream's 3.4.11). Their package-ids almost certainly differ from the ones
-deployed on DevNet, and Canton rejects a second package with the same
-(name, version) but a different package-id. **That is the whole risk; G1
-resolves it.**
+SHA-256 of the official interface DAR files (`token-standard/official/`):
 
-## G1 - verify interface package identities (read-only, run first)
+| File | SHA-256 |
+|---|---|
+| `splice-api-token-metadata-v1-1.0.0.dar` | `455eb160cb5abd4ae9918a6fbb9dad471f721adda39f0e5c76feef08d05637fc` |
+| `splice-api-token-holding-v1-1.0.0.dar` | `ef75f8eb41a65810221784fdb78bb9dfac7cb22245aba14fa7cb7f69c34e0175` |
+| `splice-api-token-transfer-instruction-v1-1.0.0.dar` | `e4c73aa7ae73fb2fc330b938ffb99f568792321640ba4b9472902aa8d742c994` |
 
-From the already-authenticated PowerShell session:
+Cantor8 runs several Amulet *implementation* versions on DevNet
+simultaneously, so we deliberately depend on the stable Token Standard
+*interfaces* above, not on any pinned Amulet implementation package ID. No
+`splice-amulet` implementation DAR is bundled.
+
+## G1 - confirm the interfaces are known to the participant (read-only)
+
+The interface IDs are already the official ones, so this is a confirmation,
+not a gate. From the already-authenticated PowerShell session:
 
 ```powershell
-# token (already working in that session; shown for completeness)
 $tok = (Invoke-RestMethod -Method Post `
   -Uri "$env:C8_IDP/realms/master/protocol/openid-connect/token" `
   -ContentType "application/x-www-form-urlencoded" `
   -Body @{grant_type="client_credentials"; client_id=$env:C8_CLIENT_ID; client_secret=$env:C8_CLIENT_SECRET}).access_token
 $H = @{Authorization = "Bearer $tok"}
-
-# every package-id the participant knows (read-only)
 $pkgs = (Invoke-RestMethod -Uri "$env:C8_BASE/v2/packages" -Headers $H).packageIds
 
-# are OUR three vendored ids already there?
-"a2b71e271f87b8d5282607f079262355eb2e42e20857613a47fce290fc3b3cde",
-"4787754c493877d34db18aae4889cb96e07f1979ca758f5d15017606ece9d0cd",
-"a1d7f008c9e8b4400e829fabc5fe1d1b6d201b9d514d37f4e723da7e51bd7817" |
+# the three official interface ids should already be present:
+"4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f",
+"718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b",
+"55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281" |
   ForEach-Object { "$_  present=$($pkgs -contains $_)" }
 ```
 
-Outcomes:
+All three present (expected) means only our own `agent-mandate` package is
+new at upload time.
 
-- **All three present** -> our rebuild matches DevNet byte-for-byte; upload
-  of `agent-mandate-0.1.0.dar` is safe as-is. (Unlikely but possible.)
-- **Any absent** -> we need the exact deployed DARs from Davide (ask for
-  the three `splice-api-token-*-v1` DAR files, or the package-ids so we can
-  fetch/verify). Then:
-
-  ```powershell
-  # drop the official DARs into daml-starter/token-standard/official/
-  # point BOTH daml.yaml data-dependencies at them (mandate/ and root),
-  # rebuild and re-verify:
-  daml build --all
-  daml test                       # all 19 scripts must stay green
-  daml damlc inspect-dar mandate/.daml/dist/agent-mandate-0.1.0.dar
-  # the three splice-api ids in the inspect output MUST now equal DevNet's
-  ```
-
-Optional cross-check if the JSON API version supports it (read-only): the
-preferred-packages endpoint resolves a package NAME to the id the
-participant would actually use:
-
-```powershell
-Invoke-RestMethod -Method Post -Uri "$env:C8_BASE/v2/interactive-submission/preferred-packages" `
-  -Headers $H -ContentType "application/json" -Body (@{
-    packageVettingRequirements = @(
-      @{ packageName = "splice-api-token-transfer-instruction-v1"; parties = @() })
-  } | ConvertTo-Json -Depth 5)
-```
-
-## G2 - upload (mutating; only after G1 passes)
+## G2 - upload (mutating; only after G1 confirms)
 
 Upload = one Ledger API call. **Vetting is NOT a separate step here**: a DAR
 uploaded through the Ledger API package service is vetted automatically on
@@ -100,13 +91,13 @@ Invoke-RestMethod -Method Post -Uri "$env:C8_BASE/v2/packages" -Headers $H `
 
 # verify it landed (read-only)
 (Invoke-RestMethod -Uri "$env:C8_BASE/v2/packages" -Headers $H).packageIds `
-  -contains "<agent-mandate package-id from inspect-dar after G1>"
+  -contains "47ead15bf3b4d49bdee259a473fa8216e97226af4e752869f57c4f5f2c0cdf09"
 ```
 
-Note: if G1 forced a rebuild against official DARs, the `agent-mandate`
-package-id CHANGES from the table above - always take it from the final
-`inspect-dar` output. There is no un-upload from the Ledger API; that is
-why G1 comes first.
+The `agent-mandate` id `47ead15b…` is stable as long as `Mandate.daml` and
+its (now official) interface dependencies are unchanged; a rebuild after any
+change to those will produce a new id, so re-run `inspect-dar` if in doubt.
+There is no un-upload from the Ledger API.
 
 Alternative (gRPC, if the JSON route is blocked):
 `daml ledger upload-dar --host api.validator.dev.digik.cantor8.tech --port 443 --access-token-file <file> mandate/.daml/dist/agent-mandate-0.1.0.dar`
@@ -156,13 +147,21 @@ session is authenticated. Every command above is paste-ready for that
 session. If the variables are exported into a shell Claude can use, the
 same steps run through `c8lab.py` unchanged.
 
-## Still needed from Davide
+## Genuinely unresolved DevNet items
 
-1. The three deployed `splice-api-token-*-v1` DAR files (or package-ids) -
-   unless G1 shows ours already match.
-2. Confirmation the hackathon credential may upload DARs (or an organiser
-   runs G2).
-3. A per-service user for the agent (CanActAs(spender) + CanReadAs(owner)
-   only) so `check-agent` can pass on DevNet.
-4. `C8_REGISTRY` base URL for transfers, and Canton Coin sent to the owner
-   party.
+1. Which actual Ledger API user the shared Keycloak `hackathon` client maps
+   to (needed before `rights <user>` / `check-agent` mean anything).
+2. That user's real rights, and whether it has package-upload / participant-
+   admin authority (decides whether we or an organiser runs G2 and the G3
+   admin steps).
+3. Whether Cantor8 can provide a least-privilege agent credential
+   (CanActAs(spender) + CanReadAs(owner) only) so `check-agent` passes on
+   DevNet rather than only on LocalNet.
+4. Live party + preapproval setup (party allocation there may need the
+   external-party flow, not `POST /v2/parties`), and Canton Coin funded to
+   the owner party.
+5. Live settlement proof: an actual on-DevNet `mandate-settle` against real
+   Amulet, which `daml test` cannot stand in for.
+
+The three Token Standard interface DARs are no longer on this list - they
+are in `token-standard/official/` and their IDs are recorded above.

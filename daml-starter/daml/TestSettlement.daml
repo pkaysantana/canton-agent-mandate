@@ -395,12 +395,18 @@ testFactoryPinnedRotation = script do
 -- is an interface implementation, and an evil-but-vetted implementation can
 -- lie about what it did. What the mandate still guarantees even then:
 --   * the spender can never select the evil factory (owner-only pinning);
---   * the evil factory cannot touch the real registry's holdings (it lacks
---     the real admin's authority), so it cannot steal - only grief;
---   * gross-debit accounting books the damage against the cap, so even the
---     griefing is bounded.
--- What it cannot detect: a fake `Settled` receipt from a factory the OWNER
--- was tricked into pinning. That is what package vetting must prevent.
+--   * a factory cannot touch holdings signed by a DIFFERENT party such as
+--     the registry (it lacks that party's authority);
+--   * gross-debit accounting books what leaves the owner against the cap,
+--     so a naive value lie is caught and the tight one is cap-bounded.
+-- What it CANNOT prevent: a factory the OWNER was deceived into pinning can
+-- (a) fake a `Settled` receipt, and (b) wield the owner authority delegated
+-- through the nested transaction against UNRELATED owner-controlled
+-- contracts - not just the transfer (see testAuthorityStealingBoundary).
+-- Pinning a factory CID stops the spender substituting a factory; it does
+-- not, and cannot, certify that factory's bytecode. That is what Canton
+-- package vetting is for, and vetting means a participant accepted an exact
+-- package hash, not that Canton judged it safe or conformant.
 testMaliciousFactoryBoundary : Script ()
 testMaliciousFactoryBoundary = script do
   s@Setup{..} <- mkSetup
@@ -443,8 +449,9 @@ testMaliciousFactoryBoundary = script do
 
   -- A factory that tries to actually CONSUME the real holdings without
   -- paying fails on authority: archiving them needs the real registry's
-  -- signature, which an evil third-party package does not have. Canton's
-  -- authorisation model stops cross-package theft, mandate or no mandate.
+  -- signature, which an evil third-party package does not have. Canton
+  -- authorisation stops it from touching holdings signed by ANOTHER party;
+  -- it does NOT stop it touching what the owner authorises (next test).
   subst <- submit agent do
     createCmd SubstitutingFactory with admin = agent; observers = [alice, agent]
   m4 <- submit alice do
@@ -455,6 +462,53 @@ testMaliciousFactoryBoundary = script do
       extraArgs = emptyExtra
   Some _ <- queryContractId alice h50    -- untouched
   pure ()
+
+-- | INTENTIONAL residual-boundary demonstration. This test is EXPECTED to
+-- succeed: it shows that a malicious factory the OWNER deliberately pins can
+-- use the owner authority delegated through the nested mandate transaction
+-- to fire an unrelated owner-controlled choice (`OwnerVault.Drain`). It is
+-- NOT a failure of the mandate's policy checks - cap, allow-list, expiry,
+-- sender and gross-debit all pass; none of them can bound what a vetted
+-- factory does with delegated authority. Daml Script cannot model Canton's
+-- package-vetting topology, so this is the closest we can get to showing
+-- why vetting stays part of the deployment trust boundary.
+testAuthorityStealingBoundary : Script ()
+testAuthorityStealingBoundary = script do
+  s@Setup{..} <- mkSetup
+  now <- getTime
+
+  -- The owner has an unrelated vault.
+  vault <- submit alice do
+    createCmd OwnerVault with owner = alice; attacker = agent
+
+  -- The attacker crafts a factory targeting that vault; the owner is
+  -- deceived into pinning it (owner-only SetFactory - the spender still
+  -- cannot do this itself).
+  evil <- submit agent do
+    createCmd AuthorityStealingFactory with
+      admin = agent; observers = [alice, agent]; targetVault = vault
+  m2 <- submit alice do
+    exerciseCmd mandateCid SetFactory with
+      newFactory = toInterfaceContractId evil
+
+  -- A tight-input, in-policy charge (input == amount, so gross-debit is
+  -- satisfied). It SUCCEEDS - and as a side effect the vault is drained,
+  -- because the factory rode the owner's delegated authority into an
+  -- unrelated choice. The mandate's policy checks all passed; none of them
+  -- can see, let alone stop, the drain.
+  h1 <- submit registry do
+    createCmd MockHolding with
+      admin = registry; owner = alice; instrumentId = inst
+      amount = 1.0; observers = [agent]
+  Some _ <- queryContractId alice vault
+  (_, rCid, _) <- submit agent do
+    exerciseCmd m2 ChargeAndSettle with
+      transfer = mkTransfer inst alice bob 1.0 [toInterfaceContractId h1] now
+      extraArgs = emptyExtra
+  Some r <- queryContractId alice rCid
+  assert (r.settlement == Settled)   -- the charge itself was in policy
+  vaultAfter <- queryContractId alice vault
+  assert (optional True (const False) vaultAfter)  -- unrelated vault is gone
 
 -- | A registry result that lists the same change holding twice would halve
 -- the measured gross debit - a cap bypass through the accounting. The

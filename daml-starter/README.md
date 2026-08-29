@@ -20,13 +20,16 @@ daml/Test.daml:testAuditTrail: ok, 5 active contracts, 9 transactions.
 daml/Test.daml:testAuthorisation: ok, 5 active contracts, 19 transactions.
 daml/Test.daml:testMandateHappyPath: ok, 4 active contracts, 5 transactions.
 daml/Test.daml:testIou: ok, 1 active contracts, 4 transactions.
+daml/TestSettlement.daml:mkSetup: ok, 3 active contracts, 4 transactions.
 daml/TestSettlement.daml:testNestedAuthority: ok, 7 active contracts, 9 transactions.
 daml/TestSettlement.daml:testSettleDirect: ok, 7 active contracts, 6 transactions.
 daml/TestSettlement.daml:testGrossDebitFees: ok, 10 active contracts, 12 transactions.
 daml/TestSettlement.daml:testSettlePendingAborts: ok, 5 active contracts, 6 transactions.
-daml/TestSettlement.daml:testSettleAdversarial: ok, 9 active contracts, 22 transactions.
+daml/TestSettlement.daml:testSettleAdversarial: ok, 9 active contracts, 23 transactions.
 daml/TestSettlement.daml:testFactoryPinnedRotation: ok, 6 active contracts, 12 transactions.
 daml/TestSettlement.daml:testMaliciousFactoryBoundary: ok, 7 active contracts, 12 transactions.
+daml/TestSettlement.daml:testAuthorityStealingBoundary: ok, 6 active contracts, 9 transactions.
+daml/TestSettlement.daml:testDuplicateChangeRejected: ok, 4 active contracts, 7 transactions.
 daml/TestSettlement.daml:testSettleAfterRevocation: ok, 2 active contracts, 6 transactions.
 daml/TestSettlement.daml:testSettleAfterExpiry: ok, 5 active contracts, 10 transactions.
 ```
@@ -34,10 +37,15 @@ daml/TestSettlement.daml:testSettleAfterExpiry: ok, 5 active contracts, 10 trans
 `daml test` runs in memory in about a second. No node, no Docker, no network.
 That is your development loop.
 
-The `token-standard/` directory vendors the three official Token Standard
-interface packages (`splice-api-token-*-v1`, Apache-2.0, from the Splice repo
-at tag 0.6.8). `multi-package.yaml` makes `daml build` compile them first, so
-a fresh clone builds with the one command above.
+Both packages compile against the **official** Token Standard interface DARs
+in `token-standard/official/` - the exact `splice-api-token-*-v1` artefacts
+Cantor8 runs on DevNet, so our package IDs match the network. The
+`token-standard/splice-api-token-*-v1/` directories keep the upstream
+interface *source* (Apache-2.0, Splice tag 0.6.8) as readable reference;
+they are deliberately NOT in the build, because compiling them produces
+package IDs that differ from the deployed ones. `multi-package.yaml` builds
+the deployable `mandate/` package then this test package, so a fresh clone
+builds with the one command above.
 
 ## What is here
 
@@ -153,15 +161,36 @@ What the code states explicitly rather than hides:
   only the receiver and the registry admin as stakeholders. That is the
   ledger model, not a missing package. `Completed` is the Token Standard's
   own guarantee, from the same vetted registry code that moved the money.
-- **The residual trust is Canton package vetting.** A factory is an
-  interface implementation, and an evil-but-vetted implementation can lie.
-  `testMaliciousFactoryBoundary` draws the line precisely: the spender can
-  never select an evil factory (pinning is owner-only), an evil factory
-  cannot consume the real registry's holdings (it lacks the real admin's
-  authority - Canton stops cross-package theft), gross-debit accounting
-  catches the naive lie and bounds the rest by the cap; what survives is a
-  falsified `Settled` receipt from a factory the OWNER was tricked into
-  pinning, and no mandate code can detect that.
+- **The factory pin stops the spender, not the code.** Pinning the factory
+  CID into the mandate prevents the *spender* substituting another factory
+  contract - that is what it is for, and it holds. It does NOT pin
+  implementation bytecode: a factory CID is not guaranteed permanent by
+  Token Standard V1, and Canton smart-contract upgrades / package
+  preference mean a CID does not cryptographically bind exact code forever.
+  So the pin is one layer; **Canton package vetting is the other**, and it
+  is part of the deployment trust boundary. Vetting means the participant
+  chose to accept an exact package hash - not that Canton certifies the
+  package as secure or conformant.
+- **What a malicious vetted factory can still do.** If the OWNER is deceived
+  into pinning one (the spender cannot - pinning is owner-only), it can lie
+  about `Settled`, and - more seriously - it can wield the owner authority
+  delegated through the nested transaction against *unrelated*
+  owner-controlled contracts, not just the transfer.
+  `testAuthorityStealingBoundary` demonstrates exactly this: a pinned evil
+  factory drains an unrelated `OwnerVault` during a normal-looking, in-policy
+  charge. Gross-debit accounting still catches a naive value lie and bounds
+  the tight one by the cap, and Canton authorisation still stops the factory
+  touching holdings signed by *another* party (the registry,
+  `testMaliciousFactoryBoundary`) - but there is no claim, and no mechanism,
+  that Canton authorisation universally prevents a vetted package from
+  reaching what the owner authorises. That is why vetting is trusted
+  infrastructure, and why `expectedAdmin` is always derived from the
+  mandate's own instrument, never from caller input.
+- **What the tests cannot prove.** Daml Script cannot model Canton's
+  package-vetting topology enforcement, so `testAuthorityStealingBoundary`
+  is an intentional demonstration of the residual boundary: it is *expected
+  to succeed* when the owner pins malicious vetted code, which is not a
+  failure of the mandate's policy checks.
 
 `TestToken.daml` is a mock registry implementing the real
 `splice-api-token-*-v1` interfaces. What `daml test` proves with it is the
