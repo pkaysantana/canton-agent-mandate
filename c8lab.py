@@ -168,11 +168,69 @@ def grant_act_as(user_id, party, sub=ADMIN):
                 sub=sub)
 
 
-def allocate_party(hint, sub=ADMIN, grant_to=USER):
-    """Allocate, or reuse if it already exists, then grant act-as rights.
+def grant_read_as(user_id, party, sub=ADMIN):
+    """CanReadAs: see the party's contracts without being able to submit for
+    it. This is what an agent service should hold over the OWNER: enough to
+    discover holdings, not enough to move them."""
+    return call(f"/v2/users/{user_id}/rights",
+                {"userId": user_id, "identityProviderId": "",
+                 "rights": [{"kind": {"CanReadAs": {"value": {"party": party}}}}]},
+                sub=sub)
 
-    Without the grant you allocate a party you cannot submit as, and every
-    later call returns 403 with a valid token.
+
+def create_user(user_id, sub=ADMIN):
+    """Create a participant user with NO rights. Grant them explicitly."""
+    return call("/v2/users", {"user": {"id": user_id,
+                                       "identityProviderId": ""}}, sub=sub)
+
+
+def user_rights(user_id, sub=ADMIN):
+    """What a user can actually do. Returns (act_as, read_as) party sets."""
+    out = call(f"/v2/users/{user_id}/rights", sub=sub)
+    act, read = set(), set()
+    for r in out.get("rights", []):
+        kind = r.get("kind", {})
+        if "CanActAs" in kind:
+            act.add(kind["CanActAs"].get("value", {}).get("party"))
+        if "CanReadAs" in kind:
+            read.add(kind["CanReadAs"].get("value", {}).get("party"))
+    return act, read
+
+
+def check_agent_user(user_id, spender, owner, sub=ADMIN):
+    """Assert the agent service credential is least-privileged.
+
+    Required:  CanActAs(spender)  - submit charges as the agent
+               CanReadAs(owner)   - discover the owner's holdings
+    Forbidden: CanActAs(owner)    - with this the service can transfer the
+                                    owner's money DIRECTLY and every mandate
+                                    limit becomes decoration.
+
+    Read-only: inspects rights, changes nothing. On the shared DevNet
+    credential this will typically FAIL, which is the honest answer: least
+    privilege there needs a per-service user from the organisers.
+    """
+    act, read = user_rights(user_id, sub=sub)
+    problems = []
+    if spender not in act:
+        problems.append(f"MISSING CanActAs({spender}): cannot submit charges")
+    if owner in act:
+        problems.append(f"HAS CanActAs({owner}): can bypass the mandate "
+                        "entirely - remove this right")
+    if owner not in read and owner not in act:
+        problems.append(f"missing CanReadAs({owner}): cannot discover the "
+                        "owner's holdings (grant with grant --read)")
+    return problems
+
+
+def allocate_party(hint, sub=ADMIN, grant_to=None):
+    """Allocate a party, or reuse it if it already exists. Grants NOTHING.
+
+    Party allocation and rights are deliberately separate: auto-granting
+    every party to one service user is how an "agent" credential quietly
+    ends up with CanActAs over the owner it is supposed to be limited by.
+    Grant explicitly: grant_act_as / grant_read_as, and verify with
+    check_agent_user.
     """
     for p in local_parties(sub):
         if p.split("::")[0] == hint:
@@ -341,12 +399,45 @@ def _iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def discover_factory(owner, instrument="Amulet"):
+    """Ask the registry which TransferFactory it currently uses.
+
+    The transfer-factory endpoint wants a concrete transfer, so this sends a
+    minimal self-transfer probe; only `factoryId` from the answer is used.
+    This is the OWNER-side lookup: the factory the owner pins into the
+    mandate comes from the owner's own preflight, never from the spender.
+    """
+    t0 = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    admin = admin_party()
+    fac = registry("/registry/transfer-instruction/v1/transfer-factory",
+                   {"choiceArguments": {
+                       "expectedAdmin": admin,
+                       "transfer": {"sender": owner, "receiver": owner,
+                                    "amount": "1.0",
+                                    "instrumentId": {"admin": admin,
+                                                     "id": instrument},
+                                    "requestedAt": _iso(t0),
+                                    "executeBefore": _iso(
+                                        t0 + datetime.timedelta(hours=1)),
+                                    "inputHoldingCids": [],
+                                    "meta": {"values": {}}},
+                       "extraArgs": {"context": {"values": {}},
+                                     "meta": {"values": {}}}}})
+    if "factoryId" not in fac:
+        raise LabError("registry did not return a factoryId for the probe; "
+                       "pass the factory contract id explicitly")
+    return fac["factoryId"]
+
+
 def mandate_propose(owner, spender, allowed, cap, hours=24,
-                    instrument="Amulet", sub=USER):
+                    instrument="Amulet", factory=None, sub=USER):
     """D1 step 1: the owner proposes a spend mandate to the agent.
 
     The cap is denominated in `instrument`; the mandate pins the instrument
     so the agent cannot settle a different token of the owner's under it.
+    It also pins the registry's TransferFactory (discovered by the OWNER's
+    registry preflight, or passed explicitly): the spender can never route
+    settlement through a factory of its own choosing.
     """
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     return submit([{"CreateCommand": {
@@ -355,7 +446,20 @@ def mandate_propose(owner, spender, allowed, cap, hours=24,
             "owner": owner, "spender": spender, "allowed": allowed,
             "cap": str(cap),
             "expiresAt": _iso(now + datetime.timedelta(hours=hours)),
-            "instrument": {"admin": admin_party(), "id": instrument}}}}],
+            "instrument": {"admin": admin_party(), "id": instrument},
+            "factory": factory or discover_factory(owner, instrument)}}}],
+        act_as=owner, sub=sub, want_transaction=True)
+
+
+def mandate_set_factory(mandate_cid, owner, instrument="Amulet",
+                        factory=None, sub=USER):
+    """Owner-only: re-point the mandate at the registry's current factory
+    after a rotation (the pinned contract was archived)."""
+    return submit([{"ExerciseCommand": {
+        "templateId": MANDATE, "contractId": mandate_cid,
+        "choice": "SetFactory",
+        "choiceArgument": {
+            "newFactory": factory or discover_factory(owner, instrument)}}}],
         act_as=owner, sub=sub, want_transaction=True)
 
 
@@ -383,11 +487,16 @@ def charge_and_settle(mandate_cid, owner, spender, receiver, amount,
     TransferFactory_Transfer on that same record. The registry cannot be
     lied to about what was authorised, because there is only one object.
 
-    CREDENTIALS: the agent service needs CanActAs(spender) and, to read the
-    owner's holdings, CanReadAs(owner). It must NOT have CanActAs(owner) -
-    with that it could transfer directly and the mandate would be decoration.
-    The owner's authority to move funds comes from the mandate contract, not
-    from this submission.
+    CREDENTIALS - the intended production model: the agent service user
+    holds CanActAs(spender) and, to read the owner's holdings,
+    CanReadAs(owner). It must NOT have CanActAs(owner) - with that it could
+    transfer directly and the mandate would be decoration. The owner's
+    authority to move funds comes from the mandate contract, not from this
+    submission. Verify with `python3 c8lab.py check-agent <user> <spender>
+    <owner>`. CAVEAT: the shared hackathon Keycloak credential is one
+    participant user that typically holds broad rights over every party on
+    the validator; on DevNet, real least privilege needs a per-service user
+    from the organisers - check-agent will tell you honestly either way.
 
     Only the direct path is supported: if the registry says the receiver has
     no preapproval ('offer'), this refuses before submitting, because the
@@ -435,13 +544,16 @@ def charge_and_settle(mandate_cid, owner, spender, receiver, amount,
     cc = fac.get("choiceContext", {})
 
     # Daml begins here: one command, one transaction, policy and settlement
-    # contractually linked inside Mandate.ChargeAndSettle.
+    # contractually linked inside Mandate.ChargeAndSettle. Note there is no
+    # factory in the arguments: settlement goes through the factory the
+    # OWNER pinned into the mandate. If the registry has rotated its factory
+    # since (fac["factoryId"] changed), this fails safe on the stale pin and
+    # the owner re-points it with mandate-set-factory.
     res = submit([{"ExerciseCommand": {
                     "templateId": MANDATE,
                     "contractId": mandate_cid,
                     "choice": "ChargeAndSettle",
                     "choiceArgument": {
-                        "factoryCid": fac["factoryId"],
                         "transfer": transfer,
                         "extraArgs": {
                             "context": cc.get("choiceContextData", {}),
@@ -509,7 +621,13 @@ def main():
     sub.add_parser("check")
     p = sub.add_parser("party");       p.add_argument("hint")
     p = sub.add_parser("holdings");    p.add_argument("party")
+    p = sub.add_parser("user");        p.add_argument("user_id")
     p = sub.add_parser("grant");       p.add_argument("user"); p.add_argument("party")
+    p.add_argument("--read", action="store_true",
+                   help="grant CanReadAs instead of CanActAs")
+    p = sub.add_parser("rights");      p.add_argument("user")
+    p = sub.add_parser("check-agent")
+    p.add_argument("user"); p.add_argument("spender"); p.add_argument("owner")
     p = sub.add_parser("preapproval"); p.add_argument("party"); p.add_argument("provider", nargs="?")
     p = sub.add_parser("transfer")
     p.add_argument("sender"); p.add_argument("receiver"); p.add_argument("amount")
@@ -521,8 +639,13 @@ def main():
     p.add_argument("cap")
     p.add_argument("--hours", type=int, default=24)
     p.add_argument("--instrument", default="Amulet")
+    p.add_argument("--factory", help="pin this factory cid instead of asking the registry")
     p = sub.add_parser("mandate-accept")
     p.add_argument("proposal_cid"); p.add_argument("spender")
+    p = sub.add_parser("mandate-set-factory")
+    p.add_argument("mandate_cid"); p.add_argument("owner")
+    p.add_argument("--instrument", default="Amulet")
+    p.add_argument("--factory", help="pin this factory cid instead of asking the registry")
     p = sub.add_parser("mandate-settle")
     p.add_argument("mandate_cid"); p.add_argument("owner"); p.add_argument("spender")
     p.add_argument("receiver"); p.add_argument("amount")
@@ -533,11 +656,38 @@ def main():
         if a.cmd in (None, "check"):
             check()
         elif a.cmd == "party":
-            print(allocate_party(a.hint))
+            party = allocate_party(a.hint)
+            print(party)
+            print("\nNo rights were granted (that is deliberate). Grant them")
+            print("explicitly, to the right user:")
+            print(f"  python3 c8lab.py grant <user> {a.hint}          # CanActAs")
+            print(f"  python3 c8lab.py grant <user> {a.hint} --read   # CanReadAs")
         elif a.cmd == "holdings":
             print(json.dumps(holdings(find_party(a.party)), indent=2))
+        elif a.cmd == "user":
+            print(json.dumps(create_user(a.user_id), indent=2))
         elif a.cmd == "grant":
-            print(json.dumps(grant_act_as(a.user, find_party(a.party)), indent=2))
+            fn = grant_read_as if a.read else grant_act_as
+            print(json.dumps(fn(a.user, find_party(a.party)), indent=2))
+        elif a.cmd == "rights":
+            act, read = user_rights(a.user)
+            print(f"user {a.user}")
+            for x in sorted(act):
+                print(f"  CanActAs   {x}")
+            for x in sorted(read):
+                print(f"  CanReadAs  {x}")
+            if not act and not read:
+                print("  (no rights)")
+        elif a.cmd == "check-agent":
+            problems = check_agent_user(a.user, find_party(a.spender),
+                                        find_party(a.owner))
+            if problems:
+                print(f"FAIL: {a.user} is not a least-privileged agent user:")
+                for x in problems:
+                    print(f"  - {x}")
+                sys.exit(1)
+            print(f"OK: {a.user} has CanActAs(spender), can read the owner, "
+                  "and does NOT have CanActAs(owner).")
         elif a.cmd == "preapproval":
             me = find_party(a.party)
             prov = find_party(a.provider) if a.provider else find_party("app_user")
@@ -558,13 +708,18 @@ def main():
         elif a.cmd == "mandate-propose":
             res = mandate_propose(find_party(a.owner), find_party(a.spender),
                                   [find_party(x) for x in a.allowed.split(",")],
-                                  a.cap, hours=a.hours, instrument=a.instrument)
+                                  a.cap, hours=a.hours, instrument=a.instrument,
+                                  factory=a.factory)
             cid = _find_created(res, "Mandate:MandateProposal")
             print(f"proposal {cid}")
             print(f"\nThe SPENDER accepts it with:\n  python3 c8lab.py "
                   f"mandate-accept {cid} {a.spender}")
         elif a.cmd == "mandate-accept":
             res = mandate_accept(a.proposal_cid, find_party(a.spender))
+            print(f"mandate {_find_created(res, 'Mandate:Mandate')}")
+        elif a.cmd == "mandate-set-factory":
+            res = mandate_set_factory(a.mandate_cid, find_party(a.owner),
+                                      instrument=a.instrument, factory=a.factory)
             print(f"mandate {_find_created(res, 'Mandate:Mandate')}")
         elif a.cmd == "mandate-settle":
             out = charge_and_settle(a.mandate_cid, find_party(a.owner),

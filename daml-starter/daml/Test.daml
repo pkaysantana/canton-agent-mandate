@@ -8,6 +8,8 @@ import Daml.Script
 import Iou
 import Mandate
 import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Splice.Api.Token.TransferInstructionV1 (TransferFactory)
+import TestToken (MockTransferFactory(..))
 
 testIou : Script ()
 testIou = script do
@@ -35,10 +37,21 @@ testIou = script do
 cc : Party -> InstrumentId
 cc registry = InstrumentId with admin = registry; id = "CC"
 
+-- Every mandate pins a transfer factory; the policy tests never settle, so
+-- they pin a throwaway mock factory signed by the instrument admin.
+makeFactory : InstrumentId -> Script (ContractId TransferFactory)
+makeFactory instrument = do
+  f <- submit instrument.admin do
+    createCmd MockTransferFactory with
+      admin = instrument.admin; observers = []; preapproved = []; fee = 0.0
+  pure (toInterfaceContractId f)
+
 makeProposal : Party -> Party -> [Party] -> Decimal -> Time -> InstrumentId -> Script (ContractId MandateProposal)
-makeProposal owner spender allowed cap expiresAt instrument = submit owner do
-  createCmd MandateProposal with
-    owner; spender; allowed; cap; expiresAt; instrument
+makeProposal owner spender allowed cap expiresAt instrument = do
+  factory <- makeFactory instrument
+  submit owner do
+    createCmd MandateProposal with
+      owner; spender; allowed; cap; expiresAt; instrument; factory
 
 testMandateHappyPath : Script ()
 testMandateHappyPath = script do
@@ -185,6 +198,7 @@ testAuthorisation = script do
   submitMustFail merchant do exerciseCmd rejected Accept
 
   -- Both signatories are required to create these contracts directly.
+  someFactory <- makeFactory (cc registry)
   submitMustFail alice do
     createCmd Mandate with
       owner = alice
@@ -194,6 +208,7 @@ testAuthorisation = script do
       spent = 0.0
       expiresAt = deadline
       instrument = cc registry
+      factory = someFactory
       mandateId = "direct"
       charges = 0
   submitMustFail merchant do
@@ -209,6 +224,8 @@ testAuthorisation = script do
       spentAfter = 1.0
       expiresAtAtCharge = deadline
       instrument = cc registry
+      grossDebit = 1.0
+      fee = 0.0
       settlement = AuthorisedOnly
 
 testRevocation : Script ()
