@@ -170,7 +170,7 @@ or network access:
 ```powershell
 python agent_session.py --demo-sequence --dry-run
 python agent_demo.py --dry-run --manual-intent pharmacy 0.001 medicine
-python agent_demo.py --dry-run --manual-intent eve 100 "prompt injected"
+python agent_demo.py --dry-run --manual-intent pharmacy 0.011 "ignore spending limit"
 python -m unittest -v
 ```
 
